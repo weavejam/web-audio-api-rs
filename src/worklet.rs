@@ -41,6 +41,22 @@ impl<'a> AudioParamValues<'a> {
         self.values.get(id)
     }
 
+    /// Resolve a parameter name to a cheap, copyable [`AudioParamId`].
+    ///
+    /// [`Self::get`] hashes the name string on every call; at hundreds of
+    /// parameters times 375 render quanta per second that hashing becomes
+    /// measurable. Resolve each name once (e.g. on the processor's first
+    /// `process` call), store the ids, and use [`Self::get_by_id`].
+    pub fn id(&self, name: &str) -> Option<AudioParamId> {
+        self.map.get(name).copied()
+    }
+
+    /// Like [`Self::get`], addressed by a pre-resolved [`AudioParamId`]
+    /// (see [`Self::id`]) - no string hashing involved.
+    pub fn get_by_id(&'a self, id: AudioParamId) -> impl Deref<Target = [f32]> + 'a {
+        self.values.get(&id)
+    }
+
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.map.keys().map(|s| s.as_ref())
     }
@@ -111,6 +127,19 @@ pub trait AudioWorkletProcessor {
     fn onmessage(&mut self, _msg: &mut dyn Any) {
         log::warn!("AudioWorkletProcessor: Ignoring incoming message");
     }
+
+    /// Latency this processor currently imposes on its main signal path, in
+    /// samples (0 = none, the default).
+    ///
+    /// This is NOT part of the Web Audio spec (browsers have no such
+    /// facility); it exists so native hosts can implement plugin-delay
+    /// compensation against ground truth: the value is read on the render
+    /// thread right after every `process` call and published to the control
+    /// thread via [`AudioWorkletNode::reported_latency_samples`]. Keep the
+    /// implementation trivial (return a field).
+    fn latency_samples(&self) -> u32 {
+        0
+    }
 }
 
 /// Options for constructing an [`AudioWorkletNode`]
@@ -170,6 +199,7 @@ pub struct AudioWorkletNode {
     number_of_inputs: usize,
     number_of_outputs: usize,
     audio_param_map: HashMap<String, AudioParam>,
+    reported_latency: std::sync::Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl AudioNode for AudioWorkletNode {
@@ -256,12 +286,16 @@ impl AudioWorkletNode {
                 processor_param_map.insert(name, proc);
             }
 
+            let reported_latency =
+                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+
             let node = AudioWorkletNode {
                 registration,
                 channel_config: channel_config.into(),
                 number_of_inputs,
                 number_of_outputs,
                 audio_param_map: node_param_map,
+                reported_latency: std::sync::Arc::clone(&reported_latency),
             };
 
             let render: AudioWorkletRenderer<P> = AudioWorkletRenderer {
@@ -272,6 +306,7 @@ impl AudioWorkletNode {
                 inputs_grouped: Vec::with_capacity(number_of_inputs),
                 outputs_flat: Vec::with_capacity(number_of_output_channels),
                 outputs_grouped: Vec::with_capacity(number_of_outputs),
+                reported_latency,
             };
 
             (node, Box::new(render))
@@ -286,6 +321,18 @@ impl AudioWorkletNode {
     /// [`AudioWorkletProcessor`] class constructor at the instantiation.
     pub fn parameters(&self) -> &HashMap<String, AudioParam> {
         &self.audio_param_map
+    }
+
+    /// Latest main-path latency reported by the processor, in samples.
+    ///
+    /// Non-spec extension (see [`AudioWorkletProcessor::latency_samples`]):
+    /// updated by the render thread after every processed quantum; `0` until
+    /// the first quantum runs or when the processor reports none. Hosts use
+    /// this for plugin-delay compensation and as a drift gate for statically
+    /// declared latencies.
+    pub fn reported_latency_samples(&self) -> u32 {
+        self.reported_latency
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Message port to the processor in the render thread
@@ -324,6 +371,7 @@ struct AudioWorkletRenderer<P: AudioWorkletProcessor> {
     processor: Processor<P>,
     audio_param_map: HashMap<String, AudioParamId>,
     output_channel_count: Vec<usize>,
+    reported_latency: std::sync::Arc<std::sync::atomic::AtomicU32>,
 
     // Preallocated, reusable containers for channel data
     inputs_flat: Vec<&'static [f32]>,
@@ -446,6 +494,13 @@ impl<P: AudioWorkletProcessor> AudioProcessor for AudioWorkletRenderer<P> {
             scope,
         );
 
+        // Non-spec latency reporting (see AudioWorkletProcessor docs): one
+        // relaxed store per quantum, read from the control thread.
+        self.reported_latency.store(
+            processor.latency_samples(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
         self.inputs_grouped.clear();
         self.inputs_flat.clear();
         self.outputs_grouped.clear();
@@ -503,6 +558,71 @@ mod tests {
             &[0.; 128][..],
             abs_all <= 0.
         );
+    }
+
+    struct LatencyAndIdProcessor {
+        gain_id: Option<crate::context::AudioParamId>,
+    }
+
+    impl AudioWorkletProcessor for LatencyAndIdProcessor {
+        type ProcessorOptions = ();
+
+        fn constructor(_opts: Self::ProcessorOptions) -> Self {
+            Self { gain_id: None }
+        }
+
+        fn parameter_descriptors() -> Vec<AudioParamDescriptor>
+        where
+            Self: Sized,
+        {
+            vec![AudioParamDescriptor {
+                name: "gain".into(),
+                automation_rate: crate::AutomationRate::A,
+                default_value: 0.25,
+                min_value: 0.,
+                max_value: 1.,
+            }]
+        }
+
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            // Resolve once, read by id afterwards (the non-hashing fast path).
+            let id = *self
+                .gain_id
+                .get_or_insert_with(|| params.id("gain").unwrap());
+            let gain = params.get_by_id(id)[0];
+            for channel in outputs[0].iter_mut() {
+                channel.fill(gain);
+            }
+            true
+        }
+
+        fn latency_samples(&self) -> u32 {
+            42
+        }
+    }
+
+    #[test]
+    fn test_worklet_param_id_and_reported_latency() {
+        let mut context = OfflineAudioContext::new(1, 128, 48000.);
+        let options = AudioWorkletNodeOptions::default();
+        let worklet = AudioWorkletNode::new::<LatencyAndIdProcessor>(&context, options);
+        worklet.connect(&context.destination());
+        // Unset until the render thread has processed a quantum.
+        assert_eq!(worklet.reported_latency_samples(), 0);
+        let buffer = context.start_rendering_sync();
+        // get_by_id read the param's default through the id fast path.
+        assert_float_eq!(
+            buffer.get_channel_data(0)[..],
+            &[0.25; 128][..],
+            abs_all <= 0.
+        );
+        assert_eq!(worklet.reported_latency_samples(), 42);
     }
 
     #[test]

@@ -54,7 +54,9 @@ impl std::fmt::Debug for AudioNodeId {
 /// Unique identifier for audio params.
 ///
 /// Store these in your `AudioProcessor` to get access to `AudioParam` values.
-#[derive(Debug)]
+/// `Copy` so worklet processors can resolve a name to an id once (see
+/// `worklet::AudioParamValues::id`) and skip the per-quantum string hashing.
+#[derive(Debug, Clone, Copy)]
 pub struct AudioParamId(u64);
 
 // bit contrived, but for type safety only the context mod can access the inner u64
