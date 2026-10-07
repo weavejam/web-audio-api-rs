@@ -586,6 +586,112 @@ impl AudioRenderQuantum {
 
         true
     }
+
+    /// Serialize this quantum into a thread-safe [`BoundarySignal`] (deep copy).
+    ///
+    /// Used by the multicore render path to carry a cut-edge producer's output
+    /// across a partition (hence thread) boundary. Unlike cloning an
+    /// `AudioRenderQuantum` — which shares an `Rc` into the producer thread's
+    /// buffer pool — this copies the raw samples so nothing `Rc`-backed ever
+    /// leaves the producing thread. It preserves two things that the summation
+    /// at the merge node depends on for *byte-identical* output:
+    ///   * which channels are silent (so `is_silent()` stays true after
+    ///     reconstruction and `add` keeps its skip-silence fast path), and
+    ///   * which channels share the same backing buffer (so
+    ///     `all_channels_identical()` — a pointer check — matches, keeping
+    ///     `add`'s identical-channel fast path).
+    ///
+    /// Both are captured by de-duplicating on the backing `Rc` pointer: silent
+    /// channels share the alloc's `zeroes` pointer, and up-mixed channels share
+    /// their source pointer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn to_boundary(&self) -> BoundarySignal {
+        let mut channel_groups: ArrayVec<u8, MAX_CHANNELS> = ArrayVec::new();
+        let mut groups: ArrayVec<BoundaryGroup, MAX_CHANNELS> = ArrayVec::new();
+        let mut group_ptrs: ArrayVec<*const f32, MAX_CHANNELS> = ArrayVec::new();
+
+        for ch in &self.channels {
+            let ptr = Rc::as_ptr(&ch.data) as *const f32;
+            if let Some(gi) = group_ptrs.iter().position(|&p| p == ptr) {
+                channel_groups.push(gi as u8);
+            } else {
+                let gi = groups.len() as u8;
+                group_ptrs.push(ptr);
+                if ch.is_silent() {
+                    groups.push(BoundaryGroup::Silent);
+                } else {
+                    let mut data = Box::new([0.0f32; RENDER_QUANTUM_SIZE]);
+                    data.copy_from_slice(&ch.data[..]);
+                    groups.push(BoundaryGroup::Samples(data));
+                }
+                channel_groups.push(gi);
+            }
+        }
+
+        BoundarySignal {
+            single_valued: self.single_valued,
+            channel_groups,
+            groups,
+        }
+    }
+}
+
+/// One distinct backing buffer referenced by a [`BoundarySignal`]'s channels.
+#[cfg(not(target_arch = "wasm32"))]
+enum BoundaryGroup {
+    /// A silent channel (reconstructed as the destination alloc's silence).
+    Silent,
+    /// A non-silent channel's raw samples (deep-copied).
+    Samples(Box<[f32; RENDER_QUANTUM_SIZE]>),
+}
+
+/// A thread-safe, deep-copied snapshot of an [`AudioRenderQuantum`] used to
+/// transfer a cut-edge signal between render partitions running on different
+/// threads. Contains only plain data (no `Rc`), so it is `Send`. Rebuild an
+/// `AudioRenderQuantum` on the consuming thread's allocator with
+/// [`Alloc::boundary_to_quantum`].
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct BoundarySignal {
+    single_valued: bool,
+    /// Per output channel: index into `groups`. Channels with the same index
+    /// share a backing buffer (reproducing the producer's pointer sharing).
+    channel_groups: ArrayVec<u8, MAX_CHANNELS>,
+    groups: ArrayVec<BoundaryGroup, MAX_CHANNELS>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Alloc {
+    /// Reconstruct an [`AudioRenderQuantum`] from a [`BoundarySignal`] using this
+    /// allocator's buffer pool. Reproduces the original channel-sharing and
+    /// silence structure so a subsequent `add` is byte-identical to the serial
+    /// render. See [`AudioRenderQuantum::to_boundary`].
+    pub(crate) fn boundary_to_quantum(&self, b: &BoundarySignal) -> AudioRenderQuantum {
+        // Materialize one channel per distinct group, then clone (share Rc) for
+        // every channel that maps to it.
+        let mut group_channels: ArrayVec<AudioRenderQuantumChannel, MAX_CHANNELS> = ArrayVec::new();
+        for g in &b.groups {
+            match g {
+                BoundaryGroup::Silent => group_channels.push(self.silence()),
+                BoundaryGroup::Samples(data) => {
+                    let mut ch = self.silence();
+                    // `make_mut` on silence (shared `zeroes`) allocates a fresh
+                    // buffer from this pool; then overwrite it with the samples.
+                    ch.make_mut().copy_from_slice(&data[..]);
+                    group_channels.push(ch);
+                }
+            }
+        }
+
+        let mut channels: ArrayVec<AudioRenderQuantumChannel, MAX_CHANNELS> = ArrayVec::new();
+        for &gi in &b.channel_groups {
+            channels.push(group_channels[gi as usize].clone());
+        }
+
+        AudioRenderQuantum {
+            channels,
+            single_valued: b.single_valued,
+        }
+    }
 }
 
 #[cfg(test)]
