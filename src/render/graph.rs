@@ -161,6 +161,13 @@ pub(crate) struct Graph {
     /// allocator of its pinned worker so no pool is touched by two threads.
     #[cfg(not(target_arch = "wasm32"))]
     worker_allocs: Vec<Alloc>,
+    /// Persistent pool of render worker threads, spawned once on the first
+    /// threaded render and parked on a barrier between quanta. Rebuilt only when
+    /// the worker count changes; torn down on drop. Spawning threads *per
+    /// quantum* was measured to be a net loss (thread-create + join dwarfs the
+    /// per-quantum DSP), so the threads live across the whole render.
+    #[cfg(not(target_arch = "wasm32"))]
+    pool: Option<WorkerPool>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -296,86 +303,212 @@ impl UnionFind {
 // Multicore executor (native only)
 // ---------------------------------------------------------------------------
 
-/// Per-worker context handed to a render thread for one quantum.
-///
-/// # Safety
-///
-/// Carries raw pointers to shared render state (`nodes`, `boundary`) whose
-/// `!Send` contents are nonetheless safe to touch concurrently *because the
-/// partition plan guarantees disjointness*:
-///   * Every node is written only by its own partition's pinned worker, and a
-///     node's buffers were rebased onto exactly that worker's allocator — so no
-///     `RefCell<Node>` and no buffer pool is ever touched by two threads.
-///   * `AudioParam`/listener nodes are union-ed into the partition they feed, so
-///     a `borrow()` for params also stays on a single worker.
-///   * `boundary` slots are written by a single producer and read only in a
-///     later DAG level; the per-level `Barrier` orders write-before-read.
-///
-/// These invariants are what make the `unsafe impl Send` below sound.
+/// Per-quantum render task, published by the main thread into [`PoolShared`]
+/// before releasing the workers. All fields are plain `Copy` data (raw pointers
+/// and scalars); they point at render state that lives for the whole quantum:
+/// `nodes`/`worker_allocs` are `Graph` fields, while `plan`/`boundary` are
+/// locals of [`Graph::render_partitioned_threaded`] that outlive the fork/join.
 #[cfg(not(target_arch = "wasm32"))]
-struct WorkerCtx<'a> {
-    worker_id: usize,
+#[derive(Clone, Copy)]
+struct PoolTask {
     nodes: *const NodeCollection,
-    plan: &'a PartitionPlan,
+    plan: *const PartitionPlan,
     boundary: *mut Option<BoundarySignal>,
-    alloc: &'a Alloc,
+    /// Base of the `worker_allocs` slice; worker `w` uses `allocs.add(w)`.
+    allocs: *const Alloc,
     frame: u64,
     time: f64,
     sample_rate: f32,
-    event_sender: crossbeam_channel::Sender<crate::events::EventDispatch>,
 }
 
-// SAFETY: see the type-level doc. Disjoint, plan-guaranteed access only.
 #[cfg(not(target_arch = "wasm32"))]
-unsafe impl Send for WorkerCtx<'_> {}
-
-/// Body of one render worker: process this worker's partitions, one DAG level at
-/// a time, synchronizing on `barrier` between levels. Returns the node ids this
-/// worker found to be end-of-life (decommissioned serially by the caller).
-#[cfg(not(target_arch = "wasm32"))]
-fn run_worker(ctx: WorkerCtx<'_>, barrier: &std::sync::Barrier) -> Vec<AudioNodeId> {
-    // SAFETY: the collection outlives the enclosing `thread::scope`; this worker
-    // only ever dereferences cells for nodes in its own partitions (disjoint
-    // across workers), per the WorkerCtx contract.
-    let nodes: &NodeCollection = unsafe { &*ctx.nodes };
-    let plan = ctx.plan;
-    let alloc = ctx.alloc;
-    let w = ctx.worker_id;
-
-    // Each worker gets its own scope so the per-node `node_id` cell is never
-    // shared across threads; the event channel is a clone of the same sink.
-    let worker_scope = AudioWorkletGlobalScope {
-        current_frame: ctx.frame,
-        current_time: ctx.time,
-        sample_rate: ctx.sample_rate,
-        node_id: std::cell::Cell::new(AudioNodeId(0)),
-        event_sender: ctx.event_sender,
+impl PoolTask {
+    const EMPTY: Self = PoolTask {
+        nodes: std::ptr::null(),
+        plan: std::ptr::null(),
+        boundary: std::ptr::null_mut(),
+        allocs: std::ptr::null(),
+        frame: 0,
+        time: 0.0,
+        sample_rate: 0.0,
     };
+}
 
+/// State shared between the main thread and the persistent render workers.
+///
+/// # Safety (why the `unsafe impl Send + Sync` below are sound)
+///
+/// The raw pointers in `task` and the `!Send` buffer state they reach are only
+/// ever touched inside the fork/join window delimited by the barriers:
+///
+/// * `start` (released by the main thread once per quantum, after it has
+///   published `task`) wakes the workers. The barrier's happens-before makes the
+///   freshly-published `task` visible to every worker.
+/// * `layer` is waited on once per DAG level by *all* parties, ordering a
+///   producer's boundary write (earlier level) before a merge's read (later
+///   level), and — on its final wait — the workers' `slots` writes before the
+///   main thread reads them.
+/// * Disjointness: every node (and its buffers, rebased onto one worker's
+///   allocator) is touched by exactly one worker; `AudioParam`/listener nodes
+///   are union-ed into the partition they feed; each `boundary` slot has one
+///   producer; each `slots[w]` is written only by worker `w`. So no
+///   `RefCell<Node>`, buffer pool, boundary slot, or free-list is ever touched
+///   by two threads at once.
+#[cfg(not(target_arch = "wasm32"))]
+struct PoolShared {
+    /// Quantum-start rendezvous: `n_workers` parties (main + spawned workers).
+    start: std::sync::Barrier,
+    /// Inter-level rendezvous, reused once per DAG level: `n_workers` parties.
+    layer: std::sync::Barrier,
+    /// Set on teardown; checked by each worker right after `start`.
+    shutdown: std::sync::atomic::AtomicBool,
+    /// The current quantum's task, published before `start`.
+    task: std::cell::UnsafeCell<PoolTask>,
+    /// Per-worker end-of-life node lists, filled before the final `layer` wait.
+    slots: Vec<std::cell::UnsafeCell<Vec<AudioNodeId>>>,
+}
+
+// SAFETY: see the type-level doc — all shared access is barrier-ordered and
+// index-disjoint, so concurrent reads/writes never alias.
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Send for PoolShared {}
+#[cfg(not(target_arch = "wasm32"))]
+unsafe impl Sync for PoolShared {}
+
+/// A persistent set of render worker threads, parked on `shared.start` between
+/// quanta. Dropping the pool signals shutdown and joins every thread.
+#[cfg(not(target_arch = "wasm32"))]
+struct WorkerPool {
+    n_workers: usize,
+    shared: std::sync::Arc<PoolShared>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for WorkerPool {
+    fn drop(&mut self) {
+        // Workers are parked at `start` between quanta (drop never races a
+        // render). Flag shutdown, release them once, and join.
+        self.shared
+            .shutdown
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.shared.start.wait();
+        for h in self.handles.drain(..) {
+            let _ = h.join();
+        }
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl WorkerPool {
+    /// Spawn `n_workers - 1` persistent worker threads (the caller is worker 0).
+    fn new(
+        n_workers: usize,
+        event_sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
+    ) -> Self {
+        let shared = std::sync::Arc::new(PoolShared {
+            start: std::sync::Barrier::new(n_workers),
+            layer: std::sync::Barrier::new(n_workers),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
+            slots: (0..n_workers)
+                .map(|_| std::cell::UnsafeCell::new(Vec::new()))
+                .collect(),
+        });
+
+        let handles = (1..n_workers)
+            .map(|w| {
+                let shared = std::sync::Arc::clone(&shared);
+                let sender = event_sender.clone();
+                std::thread::Builder::new()
+                    .name(format!("web-audio-render-{w}"))
+                    .spawn(move || worker_thread_main(w, &shared, &sender))
+                    .expect("spawn render worker")
+            })
+            .collect();
+
+        WorkerPool {
+            n_workers,
+            shared,
+            handles,
+        }
+    }
+}
+
+/// Entry point of a spawned render worker. Parks on `start` between quanta,
+/// then renders its pinned partitions for the published task until shutdown.
+#[cfg(not(target_arch = "wasm32"))]
+fn worker_thread_main(
+    w: usize,
+    shared: &PoolShared,
+    sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
+) {
+    loop {
+        shared.start.wait();
+        if shared.shutdown.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: published by the main thread before it released `start`; the
+        // barrier's happens-before makes the write visible here.
+        let task = unsafe { *shared.task.get() };
+        // SAFETY: the pointed-at state lives for the whole quantum (see PoolTask
+        // doc); this worker only reaches nodes/buffers in its own partitions.
+        let nodes: &NodeCollection = unsafe { &*task.nodes };
+        let plan: &PartitionPlan = unsafe { &*task.plan };
+        let alloc: &Alloc = unsafe { &*task.allocs.add(w) };
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: task.frame,
+            current_time: task.time,
+            sample_rate: task.sample_rate,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: sender.clone(),
+        };
+
+        run_partitions_one_quantum(w, nodes, plan, alloc, task.boundary, &scope, shared);
+    }
+}
+
+/// Render worker `w`'s pinned partitions for one quantum, one DAG level at a
+/// time, synchronizing on `shared.layer` between levels. The caller (main
+/// thread, `w == 0`) and every spawned worker run this in lock-step so the
+/// per-level barriers line up. End-of-life node ids are published into
+/// `shared.slots[w]` just before the final level barrier, so the main thread may
+/// read every slot once that barrier releases.
+#[cfg(not(target_arch = "wasm32"))]
+fn run_partitions_one_quantum(
+    w: usize,
+    nodes: &NodeCollection,
+    plan: &PartitionPlan,
+    alloc: &Alloc,
+    boundary: *mut Option<BoundarySignal>,
+    scope: &AudioWorkletGlobalScope,
+    shared: &PoolShared,
+) {
     let mut freeable: Vec<AudioNodeId> = Vec::new();
+    let last = plan.layers.len().saturating_sub(1);
 
-    for layer in &plan.layers {
+    for (level, layer) in plan.layers.iter().enumerate() {
         for &pidx in layer {
             if plan.partition_worker[pidx] != w {
                 continue;
             }
             for &index in &plan.partitions[pidx] {
-                process_node_threaded(
-                    nodes,
-                    plan,
-                    alloc,
-                    ctx.boundary,
-                    &worker_scope,
-                    index,
-                    &mut freeable,
-                );
+                process_node_threaded(nodes, plan, alloc, boundary, scope, index, &mut freeable);
+            }
+        }
+        if level == last {
+            // Publish before the final barrier so the post-barrier reader (main
+            // thread) observes a complete list.
+            // SAFETY: only worker `w` writes `slots[w]`; the final `layer` wait
+            // orders this write before the main thread's read.
+            unsafe {
+                *shared.slots[w].get() = std::mem::take(&mut freeable);
             }
         }
         // Publish this level's boundary writes before the next level reads them.
-        barrier.wait();
+        shared.layer.wait();
     }
-
-    freeable
 }
 
 /// Process a single node on a worker thread. Mirrors the per-node body of
@@ -506,6 +639,8 @@ impl Graph {
             parallel_workers,
             #[cfg(not(target_arch = "wasm32"))]
             worker_allocs: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            pool: None,
         }
     }
 
@@ -1364,52 +1499,68 @@ impl Graph {
             (0..plan.boundary_count).map(|_| None).collect();
         let boundary_base = boundary.as_mut_ptr();
 
-        let nodes_ptr: *const NodeCollection = &self.nodes;
-        let plan_ref: &PartitionPlan = &plan;
-        let frame = scope.current_frame;
-        let time = scope.current_time;
-        let sample_rate = scope.sample_rate;
-        let barrier = std::sync::Barrier::new(n_workers);
+        // Ensure the persistent worker pool matches the current worker count.
+        // Spawning per quantum was measured to be a net loss (thread create/join
+        // dwarfs the per-quantum DSP), so the threads live across the render and
+        // park on `shared.start` between quanta.
+        if self.pool.as_ref().is_none_or(|p| p.n_workers != n_workers) {
+            // Drop any stale pool first (joins its threads) before spawning anew.
+            self.pool = None;
+            self.pool = Some(WorkerPool::new(n_workers, &scope.event_sender));
+        }
+        // Clone the Arc so no borrow of `self.pool` is held while we borrow
+        // `self.nodes`/`self.worker_allocs` for the render below.
+        let shared = std::sync::Arc::clone(&self.pool.as_ref().unwrap().shared);
 
-        // Fork: spawn workers 1..n; the calling thread acts as worker 0. The
-        // scope joins every worker before returning, after which the shared
-        // borrows above are released and `self.nodes` can be mutated again.
-        let freeables: Vec<Vec<AudioNodeId>> = std::thread::scope(|s| {
-            let mut handles = Vec::with_capacity(n_workers - 1);
-            for w in 1..n_workers {
-                let ctx = WorkerCtx {
-                    worker_id: w,
-                    nodes: nodes_ptr,
-                    plan: plan_ref,
-                    boundary: boundary_base,
-                    alloc: &self.worker_allocs[w],
-                    frame,
-                    time,
-                    sample_rate,
-                    event_sender: scope.event_sender.clone(),
-                };
-                let barrier_ref = &barrier;
-                handles.push(s.spawn(move || run_worker(ctx, barrier_ref)));
-            }
-
-            let ctx0 = WorkerCtx {
-                worker_id: 0,
-                nodes: nodes_ptr,
-                plan: plan_ref,
+        // Publish this quantum's task, then release the parked workers. The raw
+        // pointers reach render state that lives for the whole quantum; the
+        // `start` barrier's happens-before makes the task visible to workers.
+        // SAFETY: workers are parked at `start`; nothing reads `task` until the
+        // `start.wait()` below releases them.
+        unsafe {
+            *shared.task.get() = PoolTask {
+                nodes: &self.nodes,
+                plan: &plan,
                 boundary: boundary_base,
-                alloc: &self.worker_allocs[0],
-                frame,
-                time,
-                sample_rate,
-                event_sender: scope.event_sender.clone(),
+                allocs: self.worker_allocs.as_ptr(),
+                frame: scope.current_frame,
+                time: scope.current_time,
+                sample_rate: scope.sample_rate,
             };
-            let mut results = Vec::with_capacity(n_workers);
-            results.push(run_worker(ctx0, &barrier));
-            for h in handles {
-                results.push(h.join().expect("render worker thread panicked"));
-            }
-            results
-        });
+        }
+        shared.start.wait();
+
+        // The calling thread acts as worker 0, running in lock-step with the
+        // spawned workers on the per-level barrier.
+        let scope0 = AudioWorkletGlobalScope {
+            current_frame: scope.current_frame,
+            current_time: scope.current_time,
+            sample_rate: scope.sample_rate,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: scope.event_sender.clone(),
+        };
+        run_partitions_one_quantum(
+            0,
+            &self.nodes,
+            &plan,
+            &self.worker_allocs[0],
+            boundary_base,
+            &scope0,
+            &shared,
+        );
+
+        // The final `layer` barrier has released: every worker has processed its
+        // partitions and published its free-list. Collect them.
+        let freeables: Vec<Vec<AudioNodeId>> = shared
+            .slots
+            .iter()
+            .map(|s| {
+                // SAFETY: barrier-ordered; workers are now parked at `start` and
+                // no longer touch their slots.
+                unsafe { std::mem::take(&mut *s.get()) }
+            })
+            .collect();
+        drop(shared);
 
         // Drop boundary buffers now (on this thread) before any node mutation.
         drop(boundary);
