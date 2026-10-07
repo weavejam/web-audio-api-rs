@@ -376,10 +376,10 @@ impl RenderThread {
             // SAFETY: potentially risky - "modifying the masking flags, rounding mode, or
             // denormals-are-zero mode flags leads to immediate Undefined Behavior: Rust assumes
             // that these are always in their default state and will optimize accordingly."
-            no_denormals::no_denormals(|| graph.render(&scope))
+            no_denormals::no_denormals(|| graph.render_quantum(&scope))
         };
         #[cfg(not(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64")))]
-        let rendered = graph.render(&scope);
+        let rendered = graph.render_quantum(&scope);
 
         // Use a specialized copyToChannel implementation for performance
         let remaining = (buffer[0].capacity() - buffer[0].len()).min(RENDER_QUANTUM_SIZE);
@@ -500,7 +500,8 @@ impl RenderThread {
             };
 
             // render audio graph, clone it in case we need to mutate/store the value later
-            let mut destination_buffer = self.graph.as_mut().unwrap().render(&scope).clone();
+            let mut destination_buffer =
+                self.graph.as_mut().unwrap().render_quantum(&scope).clone();
 
             // online AudioContext allows channel count to be less than the number
             // of channels of the backend stream, i.e. number of channels of the
