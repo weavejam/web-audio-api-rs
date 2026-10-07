@@ -6,7 +6,7 @@
 use web_audio_api::context::{
     AudioContext, AudioContextOptions, AudioContextState, BaseAudioContext,
 };
-use web_audio_api::node::AudioNode;
+use web_audio_api::node::{AudioNode, AudioScheduledSourceNode};
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -295,6 +295,41 @@ fn test_closed() {
         done_rx.recv_timeout(TEST_TIMEOUT).is_ok(),
         "timed out waiting for node disconnect after closing context"
     );
+}
+
+#[test]
+fn test_render_parallelism_live_none() {
+    // Drive the multicore (graph-partition) executor on the *real* render
+    // thread via the 'none' backend, exercising the per-context
+    // `render_parallelism` override rather than the global env var. Byte
+    // identity to serial is covered by the graph-level unit test; here we only
+    // assert the live render thread adopts a multi-partition graph and keeps
+    // making progress (i.e. the worker pool does not deadlock or panic).
+    let options = AudioContextOptions {
+        sink_id: "none".into(),
+        render_parallelism: Some(4),
+        ..AudioContextOptions::default()
+    };
+    let context = AudioContext::new(options);
+
+    // Two independent source->gain chains summed at the destination: a fan-in
+    // the partitioner cuts into separate partitions spread across workers.
+    for _ in 0..2 {
+        let mut osc = context.create_oscillator();
+        let gain = context.create_gain();
+        osc.connect(&gain);
+        gain.connect(&context.destination());
+        osc.start();
+    }
+
+    wait_until_current_time_at_least(
+        &context,
+        context.current_time() + 0.2,
+        "timed out waiting for the parallel render thread to make progress",
+    );
+
+    context.close_sync();
+    assert_eq!(context.state(), AudioContextState::Closed);
 }
 
 #[test]

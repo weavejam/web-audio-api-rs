@@ -644,6 +644,16 @@ impl Graph {
         }
     }
 
+    /// Override the number of multicore render-worker threads for this graph.
+    ///
+    /// Takes precedence over the `WEB_AUDIO_RS_PARALLEL` env var read in
+    /// [`Graph::new`]. `0` or `1` render serially; `n >= 2` renders across `n`
+    /// threads (byte-identical to serial). No-op in effect on wasm, where the
+    /// parallel executor is not compiled in.
+    pub(crate) fn set_parallel_workers(&mut self, workers: usize) {
+        self.parallel_workers = workers;
+    }
+
     #[cfg(feature = "diagnostics")]
     pub fn diagnostics(&self) -> AudioGraphDiagnostics {
         let mut edge_count = 0;
