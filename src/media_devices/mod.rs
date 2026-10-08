@@ -168,6 +168,7 @@ impl From<MediaTrackConstraints> for AudioContextOptions {
             sample_rate: value.sample_rate,
             sink_id,
             render_size_hint: Default::default(),
+            render_parallelism: None,
         }
     }
 }

@@ -129,6 +129,20 @@ pub struct AudioContextOptions {
 
     /// Option to request a default, optimized or specific render quantum size. It is a hint that might not be honored.
     pub render_size_hint: AudioContextRenderSizeCategory,
+
+    /// Number of worker threads for the multicore (graph-partition) render executor.
+    ///
+    /// Native only; ignored on wasm. `None` (the default) falls back to the
+    /// `WEB_AUDIO_RS_PARALLEL` environment variable, and absent that renders
+    /// serially. `Some(0)` or `Some(1)` force serial. `Some(n >= 2)` renders the
+    /// graph across `n` threads, byte-identical to serial.
+    ///
+    /// This is a per-context override deliberately *not* driven by the global
+    /// env var: a host running several `OfflineAudioContext`s concurrently (e.g.
+    /// a multi-stem export) must leave this `None` on those contexts to avoid
+    /// over-subscribing cores, while setting a small explicit count on its one
+    /// live `AudioContext`.
+    pub render_parallelism: Option<usize>,
 }
 
 /// This interface represents an audio graph whose `AudioDestinationNode` is routed to a real-time
@@ -246,6 +260,10 @@ impl AudioContext {
             }
         }
 
+        // Per-context multicore override, captured before `options` is consumed
+        // by `build_output` below.
+        let render_parallelism = options.render_parallelism;
+
         // Set up the audio output thread
         let (control_thread_init, render_thread_init) = io::thread_init();
         let startup_pending = Arc::clone(&render_thread_init.startup_pending);
@@ -262,7 +280,11 @@ impl AudioContext {
 
         // Construct the audio Graph and hand it to the render thread
         let (node_id_producer, node_id_consumer) = llq::Queue::new().split();
-        let graph = Graph::new(node_id_producer);
+        let mut graph = Graph::new(node_id_producer);
+        // An explicit per-context worker count overrides the env-var default.
+        if let Some(workers) = render_parallelism {
+            graph.set_parallel_workers(workers);
+        }
         let message = ControlMessage::Startup { graph };
         ctrl_msg_send.send(message).unwrap();
 
@@ -423,6 +445,7 @@ impl AudioContext {
             latency_hint: AudioContextLatencyCategory::default(), // todo reuse existing setting
             sink_id,
             render_size_hint: AudioContextRenderSizeCategory::default(), // todo reuse existing setting
+            render_parallelism: None,
         };
         log::debug!("SinkChange: starting audio stream");
         *backend_manager_guard = io::build_output(options, self.render_thread_init.clone())?;
