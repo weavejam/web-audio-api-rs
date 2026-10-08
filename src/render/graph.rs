@@ -2645,4 +2645,209 @@ mod tests {
             }
         }
     }
+
+    // A live graph edit between quanta must invalidate the cached partition plan,
+    // and the threaded executor must then render the EDITED topology
+    // byte-identically to the serial render of that same edited graph. Guards the
+    // "graph edits mid-render" path: a stale plan or an un-rebased worker buffer
+    // would leak the pre-edit graph's output.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_threaded_plan_invalidated_by_graph_edit() {
+        use std::cell::Cell;
+
+        #[derive(Debug, Clone)]
+        struct ConstSource {
+            value: f32,
+        }
+        impl AudioProcessor for ConstSource {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s = self.value);
+                true
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct PassThrough;
+        impl AudioProcessor for PassThrough {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0] = inputs[0].clone();
+                true
+            }
+        }
+
+        // Five order-sensitive sources fan into a merge (0), with a listener (1)
+        // to keep the graph alive. Source id = 2 + index.
+        fn build(values: &[f32]) -> Graph {
+            let mut g = Graph::new(llq::Queue::new().split().0);
+            add_node(&mut g, 0, Box::new(PassThrough));
+            add_node(&mut g, 1, Box::new(TestNode { tail_time: true }));
+            for (i, &v) in values.iter().enumerate() {
+                let src = 2 + i as u64;
+                add_node(&mut g, src, Box::new(ConstSource { value: v }));
+                add_edge(&mut g, src, 0);
+            }
+            g
+        }
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        let values: [f32; 5] = [1e20, 1.0, -1e20, 3.5, 7.0];
+        let mut threaded = build(&values);
+        threaded.parallel_workers = 4;
+        let mut serial = build(&values);
+
+        // Quantum 0: warm the threaded executor so a plan is cached.
+        let _ = threaded.render_partitioned_threaded(&scope);
+        assert_eq!(
+            threaded.partition_plan.as_ref().unwrap().boundary_count,
+            5,
+            "five cut edges -> five boundaries before the edit"
+        );
+
+        // Identical edit on both graphs: drop the last source's cut edge (id 6).
+        let last = AudioNodeId(2 + (values.len() as u64 - 1));
+        threaded.remove_edge((last, 0), (AudioNodeId(0), 0));
+        serial.remove_edge((last, 0), (AudioNodeId(0), 0));
+        assert!(
+            threaded.partition_plan.is_none(),
+            "a graph edit must invalidate the cached partition plan"
+        );
+
+        // Quantum 1: the threaded render of the edited graph must match the
+        // serial render of the identically-edited graph, bit for bit.
+        let got: Vec<u32> = threaded
+            .render_partitioned_threaded(&scope)
+            .channel_data(0)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        let expected: Vec<u32> = serial
+            .render(&scope)
+            .channel_data(0)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+        assert_eq!(
+            got, expected,
+            "threaded render after a graph edit must equal serial of the edited topology"
+        );
+
+        // The plan was recomputed with one fewer boundary (no stale boundary_count).
+        assert_eq!(
+            threaded.partition_plan.as_ref().unwrap().boundary_count,
+            4,
+            "removed cut edge -> one fewer boundary after replan"
+        );
+    }
+
+    // With far more workers than useful partitions (and typically more than
+    // cores), the threaded executor must still terminate (no barrier deadlock
+    // with many idle workers) and stay byte-identical to serial.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_threaded_more_workers_than_partitions() {
+        use std::cell::Cell;
+
+        #[derive(Debug, Clone)]
+        struct ConstSource {
+            value: f32,
+        }
+        impl AudioProcessor for ConstSource {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s = self.value);
+                true
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct PassThrough;
+        impl AudioProcessor for PassThrough {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0] = inputs[0].clone();
+                true
+            }
+        }
+
+        // Only three fan-in partitions, but 64 workers requested.
+        let values: [f32; 3] = [1e20, 1.0, -1e20];
+        fn build(values: &[f32; 3]) -> Graph {
+            let mut g = Graph::new(llq::Queue::new().split().0);
+            add_node(&mut g, 0, Box::new(PassThrough));
+            add_node(&mut g, 1, Box::new(TestNode { tail_time: true }));
+            for (i, &v) in values.iter().enumerate() {
+                let src = 2 + i as u64;
+                add_node(&mut g, src, Box::new(ConstSource { value: v }));
+                add_edge(&mut g, src, 0);
+            }
+            g
+        }
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        let expected: Vec<u32> = build(&values)
+            .render(&scope)
+            .channel_data(0)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect();
+
+        let mut g = build(&values);
+        g.parallel_workers = 64;
+        // Two quanta: reaching the assertion at all proves no deadlock.
+        for q in 0..2 {
+            let got: Vec<u32> = g
+                .render_partitioned_threaded(&scope)
+                .channel_data(0)
+                .iter()
+                .map(|x| x.to_bits())
+                .collect();
+            assert_eq!(
+                got, expected,
+                "64-worker threaded render (quantum {q}) must be byte-identical to serial"
+            );
+        }
+    }
 }

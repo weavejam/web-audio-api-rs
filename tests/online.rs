@@ -333,6 +333,72 @@ fn test_render_parallelism_live_none() {
 }
 
 #[test]
+fn test_offline_renders_unaffected_by_live_parallelism() {
+    // The per-context `render_parallelism` override is wired only into the live
+    // AudioContext, so concurrent OfflineAudioContext renders must (a) complete
+    // and (b) stay byte-identical to a baseline render — they neither inherit the
+    // live parallelism (which would over-subscribe cores during stem exports) nor
+    // have their buffers perturbed by the live parallel pool running alongside.
+    use web_audio_api::context::OfflineAudioContext;
+
+    const LEN: usize = 2048;
+    // A deterministic offline render: one constant source -> destination.
+    fn render_once() -> Vec<u32> {
+        let mut ctx = OfflineAudioContext::new(1, LEN, 48_000.);
+        let mut src = ctx.create_constant_source();
+        src.offset().set_value(0.5);
+        src.connect(&ctx.destination());
+        src.start();
+        ctx.start_rendering_sync()
+            .get_channel_data(0)
+            .iter()
+            .map(|x| x.to_bits())
+            .collect()
+    }
+
+    // Reference with no live context in play.
+    let reference = render_once();
+    assert!(
+        reference.iter().all(|&b| b == 0.5_f32.to_bits()),
+        "constant-source render must be exactly 0.5 on every sample"
+    );
+
+    // Bring up a live parallel-render context and keep it busy.
+    let live = AudioContext::new(AudioContextOptions {
+        sink_id: "none".into(),
+        render_parallelism: Some(4),
+        ..AudioContextOptions::default()
+    });
+    for _ in 0..2 {
+        let mut osc = live.create_oscillator();
+        let gain = live.create_gain();
+        osc.connect(&gain);
+        gain.connect(&live.destination());
+        osc.start();
+    }
+    wait_until_current_time_at_least(
+        &live,
+        live.current_time() + 0.05,
+        "timed out waiting for the live parallel context to start",
+    );
+
+    // Run several offline renders concurrently *while* the live context renders.
+    let outputs: Vec<Vec<u32>> = thread::scope(|scope| {
+        let handles: Vec<_> = (0..4).map(|_| scope.spawn(render_once)).collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    for (i, out) in outputs.iter().enumerate() {
+        assert_eq!(
+            out, &reference,
+            "concurrent offline render {i} must match the live-free reference"
+        );
+    }
+
+    live.close_sync();
+    assert_eq!(live.state(), AudioContextState::Closed);
+}
+
+#[test]
 fn test_double_suspend() {
     let options = AudioContextOptions {
         sink_id: "none".into(),
