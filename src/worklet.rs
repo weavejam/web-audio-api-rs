@@ -6,11 +6,15 @@
 //! - `examples/worklet_bitcrusher.rs` (real world example)
 
 pub use crate::render::AudioWorkletGlobalScope;
+// Re-exported so downstream crates can name the return type of
+// `AudioWorkletProcessor::thread_affinity` and override it (the `render` module
+// is private).
+pub use crate::render::ThreadAffinity;
 
 use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
 use crate::node::{AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::{AudioParam, AudioParamDescriptor};
-use crate::render::{AudioProcessor, AudioRenderQuantum, ThreadAffinity};
+use crate::render::{AudioProcessor, AudioRenderQuantum};
 use crate::{MessagePort, MAX_CHANNELS};
 
 use std::any::Any;
