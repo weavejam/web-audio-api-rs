@@ -47,6 +47,41 @@ jobs:
       - name: Build package
         run: cargo package --locked --verbose --all-features
 
+  parallel:
+    # Re-run the whole test corpus with the graph-partition parallel executor
+    # forced on (WEB_AUDIO_RS_PARALLEL), to catch any node with a hidden
+    # thread-affinity or buffer-lifetime assumption that the hand-built graph
+    # tests do not reach. Output byte-identity to serial is asserted inside the
+    # tests themselves; kept to 2 workers to bound CI load.
+    runs-on: ubuntu-latest
+    env:
+      WEB_AUDIO_RS_PARALLEL: "2"
+
+    steps:
+      - name: Install ALSA, Jack and PipeWire dependencies
+        run: |
+          sudo apt-get update && sudo apt-get install -y libasound2-dev libjack-jackd2-dev libpipewire-0.3-dev cmake clang
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Generate Cargo.lock
+        run: cargo generate-lockfile
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ${{ github.workflow }}-${{ github.job }}
+
+      - name: Run tests (parallel executor)
+        # `sort_mute_cycle` asserts the serial node *execution order*, which the
+        # parallel executor deliberately does not preserve (it preserves the
+        # summation fold order and the resulting samples, not the visit order).
+        run: cargo test --verbose --all-features -- --skip sort_mute_cycle
+
   msrv:
     runs-on: ubuntu-latest
 
