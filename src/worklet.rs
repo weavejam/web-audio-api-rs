@@ -10,7 +10,7 @@ pub use crate::render::AudioWorkletGlobalScope;
 use crate::context::{AudioContextRegistration, AudioParamId, BaseAudioContext};
 use crate::node::{AudioNode, AudioNodeOptions, ChannelConfig};
 use crate::param::{AudioParam, AudioParamDescriptor};
-use crate::render::{AudioProcessor, AudioRenderQuantum};
+use crate::render::{AudioProcessor, AudioRenderQuantum, ThreadAffinity};
 use crate::{MessagePort, MAX_CHANNELS};
 
 use std::any::Any;
@@ -111,6 +111,28 @@ pub trait AudioWorkletProcessor {
         params: AudioParamValues<'b>,
         scope: &'b AudioWorkletGlobalScope,
     ) -> bool;
+
+    /// The thread-affinity constraint this processor type places on the
+    /// multicore render executor.
+    ///
+    /// This is a static property of the processor type (like
+    /// [`parameter_descriptors`](Self::parameter_descriptors)), so the executor
+    /// knows it the moment the node joins the graph — before the processor
+    /// instance is lazily constructed on its first render. That matters: the
+    /// constraint must be honored on the *very first* partition plan, so a
+    /// thread-pinned node is never first run on one worker and then migrated.
+    ///
+    /// Defaults to [`ThreadAffinity::Any`] (may run on any render worker).
+    /// Override to [`ThreadAffinity::RenderThread`] for a processor that bridges
+    /// to foreign code asserting a stable calling thread — e.g. a CLAP plugin
+    /// whose `process` checks it is always invoked from the same OS thread — so a
+    /// graph edit can never migrate it to a different worker between quanta.
+    fn thread_affinity() -> ThreadAffinity
+    where
+        Self: Sized,
+    {
+        ThreadAffinity::Any
+    }
 
     /// Handle incoming messages from the linked AudioNode
     ///
@@ -516,6 +538,10 @@ impl<P: AudioWorkletProcessor> AudioProcessor for AudioWorkletRenderer<P> {
     fn has_side_effects(&self) -> bool {
         true // could be IO, message passing, ..
     }
+
+    fn thread_affinity(&self) -> ThreadAffinity {
+        P::thread_affinity()
+    }
 }
 
 #[cfg(test)]
@@ -557,6 +583,68 @@ mod tests {
             buffer.get_channel_data(0)[..],
             &[0.; 128][..],
             abs_all <= 0.
+        );
+    }
+
+    struct PinnedProcessor;
+
+    impl AudioWorkletProcessor for PinnedProcessor {
+        type ProcessorOptions = ();
+
+        fn constructor(_opts: Self::ProcessorOptions) -> Self {
+            PinnedProcessor {}
+        }
+
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            _outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            _params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            true
+        }
+
+        fn thread_affinity() -> ThreadAffinity {
+            ThreadAffinity::RenderThread
+        }
+    }
+
+    // The worklet affinity is a static type property, and the renderer adapter
+    // reports it through the `AudioProcessor` trait the executor sees — without
+    // having to construct the (lazily-built) processor instance first.
+    #[test]
+    fn test_worklet_thread_affinity_forwards_to_audio_processor() {
+        assert_eq!(TestProcessor::thread_affinity(), ThreadAffinity::Any);
+        assert_eq!(
+            PinnedProcessor::thread_affinity(),
+            ThreadAffinity::RenderThread
+        );
+
+        fn renderer<P: AudioWorkletProcessor>() -> AudioWorkletRenderer<P>
+        where
+            P::ProcessorOptions: Default,
+        {
+            AudioWorkletRenderer {
+                processor: Processor::new(P::ProcessorOptions::default()),
+                audio_param_map: HashMap::new(),
+                output_channel_count: Vec::new(),
+                reported_latency: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                inputs_flat: Vec::new(),
+                inputs_grouped: Vec::new(),
+                outputs_flat: Vec::new(),
+                outputs_grouped: Vec::new(),
+            }
+        }
+
+        // Reported before the processor instance exists (still `Uninit`), proving
+        // the executor can pin it on the very first partition plan.
+        let any = renderer::<TestProcessor>();
+        let pinned = renderer::<PinnedProcessor>();
+        assert_eq!(AudioProcessor::thread_affinity(&any), ThreadAffinity::Any);
+        assert_eq!(
+            AudioProcessor::thread_affinity(&pinned),
+            ThreadAffinity::RenderThread
         );
     }
 
