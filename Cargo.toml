@@ -54,6 +54,12 @@ vecmath = "1.0"
 [target.'cfg(any(target_arch = "x86", target_arch = "x86_64", target_arch = "aarch64"))'.dependencies]
 no_denormals = "0.3"
 
+# Realtime scheduling for the parallel render worker pool (SCHED_FIFO via
+# pthread). Unix-only; Windows uses the MMCSS API from avrt via a raw extern
+# block, and wasm has no worker pool, so neither pulls libc.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 futures = { version = "0.3.30", features = ["executor"] }
 alloc_counter = "0.0.4"
