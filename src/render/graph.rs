@@ -534,10 +534,11 @@ mod rt_priority {
             return AudioThreadPriority::Unsupported;
         }
         // A middling realtime priority: above ordinary work, below the most
-        // critical kernel/driver threads.
-        let param = libc::sched_param {
-            sched_priority: min + (max - min) / 2,
-        };
+        // critical kernel/driver threads. Zero-init the struct (it has
+        // platform-private padding on macOS, so a field literal won't compile).
+        // SAFETY: `sched_param` is a plain C struct; all-zero is a valid value.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
+        param.sched_priority = min + (max - min) / 2;
         // SAFETY: `param` outlives the call; `pthread_self` is always valid.
         let rc =
             unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
@@ -551,7 +552,8 @@ mod rt_priority {
     #[cfg(test)]
     pub(super) fn current_thread_is_elevated() -> bool {
         let mut policy = 0i32;
-        let mut param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: `sched_param` is a plain C struct; all-zero is a valid value.
+        let mut param: libc::sched_param = unsafe { std::mem::zeroed() };
         // SAFETY: both out pointers are valid for the call.
         let rc =
             unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
