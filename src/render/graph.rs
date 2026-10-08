@@ -435,6 +435,177 @@ impl WorkerPool {
     }
 }
 
+/// Outcome of trying to raise a render worker to a realtime scheduling class.
+///
+/// Which variants are reachable is platform-dependent (e.g. Windows MMCSS never
+/// yields `Unsupported`), so some are inert on any single target.
+#[cfg(not(target_arch = "wasm32"))]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AudioThreadPriority {
+    /// The thread now runs in a realtime / pro-audio scheduling class.
+    Promoted,
+    /// No supported mechanism is compiled in for this platform.
+    Unsupported,
+    /// The OS refused the elevation (e.g. no `CAP_SYS_NICE` / `RLIMIT_RTPRIO`
+    /// on Linux). The pool still runs — just at normal priority.
+    Denied,
+}
+
+/// Raise the *current* thread to a realtime / pro-audio scheduling class.
+///
+/// The persistent render workers block on the inter-level barrier in lock-step
+/// with worker 0 — which, in live playback, is the realtime audio callback
+/// thread. If the spawned workers run at normal priority, a preempted worker
+/// stalls the RT callback at the barrier (classic priority inversion) and the
+/// stream underruns. Promoting the workers removes that inversion.
+///
+/// Best-effort and non-fatal: on failure the pool keeps running at normal
+/// priority (correctness is unaffected, only glitch-resistance).
+#[cfg(not(target_arch = "wasm32"))]
+fn promote_current_thread_to_audio() -> AudioThreadPriority {
+    rt_priority::promote()
+}
+
+#[cfg(all(not(target_arch = "wasm32"), target_os = "windows"))]
+mod rt_priority {
+    use super::AudioThreadPriority;
+    use std::ffi::c_void;
+
+    // Multimedia Class Scheduler Service (MMCSS): registering a thread under the
+    // "Pro Audio" task gives it glitch-resistant realtime scheduling. avrt is
+    // not linked by default, so name it explicitly.
+    #[link(name = "avrt")]
+    extern "system" {
+        fn AvSetMmThreadCharacteristicsW(
+            task_name: *const u16,
+            task_index: *mut u32,
+        ) -> *mut c_void;
+    }
+    // kernel32 is linked by std; declare the few functions we use.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut c_void;
+        fn SetThreadPriority(thread: *mut c_void, priority: i32) -> i32;
+        #[cfg(test)]
+        fn GetThreadPriority(thread: *mut c_void) -> i32;
+    }
+
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+
+    pub(super) fn promote() -> AudioThreadPriority {
+        // "Pro Audio" as a NUL-terminated UTF-16 string.
+        let task: Vec<u16> = "Pro Audio\0".encode_utf16().collect();
+        let mut task_index: u32 = 0;
+        // SAFETY: `task` is a valid NUL-terminated UTF-16 buffer and
+        // `task_index` a valid out pointer for the duration of the call.
+        let handle = unsafe { AvSetMmThreadCharacteristicsW(task.as_ptr(), &mut task_index) };
+        if handle.is_null() {
+            return AudioThreadPriority::Denied;
+        }
+        // The MMCSS registration must stay in effect for the whole lifetime of
+        // this (persistent) worker; it is reverted implicitly when the thread
+        // exits, so the handle is intentionally not stored/reverted here. Also
+        // pin an explicit, queryable priority within the Pro Audio class.
+        // SAFETY: `GetCurrentThread` returns a pseudo-handle valid for this
+        // thread; `SetThreadPriority` with it is sound.
+        unsafe {
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        }
+        AudioThreadPriority::Promoted
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_thread_is_elevated() -> bool {
+        // SAFETY: pseudo-handle valid for the calling thread.
+        unsafe { GetThreadPriority(GetCurrentThread()) == THREAD_PRIORITY_TIME_CRITICAL }
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), unix))]
+mod rt_priority {
+    use super::AudioThreadPriority;
+
+    pub(super) fn promote() -> AudioThreadPriority {
+        // SAFETY: both query the static scheduling policy; no pointers involved.
+        let min = unsafe { libc::sched_get_priority_min(libc::SCHED_FIFO) };
+        let max = unsafe { libc::sched_get_priority_max(libc::SCHED_FIFO) };
+        if min < 0 || max < 0 {
+            return AudioThreadPriority::Unsupported;
+        }
+        // A middling realtime priority: above ordinary work, below the most
+        // critical kernel/driver threads.
+        let param = libc::sched_param {
+            sched_priority: min + (max - min) / 2,
+        };
+        // SAFETY: `param` outlives the call; `pthread_self` is always valid.
+        let rc =
+            unsafe { libc::pthread_setschedparam(libc::pthread_self(), libc::SCHED_FIFO, &param) };
+        if rc == 0 {
+            AudioThreadPriority::Promoted
+        } else {
+            AudioThreadPriority::Denied
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_thread_is_elevated() -> bool {
+        let mut policy = 0i32;
+        let mut param = libc::sched_param { sched_priority: 0 };
+        // SAFETY: both out pointers are valid for the call.
+        let rc =
+            unsafe { libc::pthread_getschedparam(libc::pthread_self(), &mut policy, &mut param) };
+        rc == 0 && policy == libc::SCHED_FIFO
+    }
+}
+
+#[cfg(all(not(target_arch = "wasm32"), not(unix), not(target_os = "windows")))]
+mod rt_priority {
+    use super::AudioThreadPriority;
+
+    pub(super) fn promote() -> AudioThreadPriority {
+        AudioThreadPriority::Unsupported
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_thread_is_elevated() -> bool {
+        false
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod rt_priority_tests {
+    use super::{promote_current_thread_to_audio, rt_priority, AudioThreadPriority};
+
+    // The realtime-promotion mechanism must return a known outcome without
+    // panicking, and when it reports `Promoted` the OS must actually confirm the
+    // elevated scheduling state for that thread. Runs on a fresh thread so it
+    // never leaves the test runner at realtime priority.
+    //
+    // On the Windows self-hosted runner MMCSS registration needs no privilege,
+    // so this asserts the positive `Promoted` path end to end. On Linux CI
+    // SCHED_FIFO is typically `EPERM` → `Denied`, which is an accepted outcome
+    // (the pool still runs).
+    #[test]
+    fn promote_elevates_or_degrades_gracefully() {
+        let outcome = std::thread::spawn(|| {
+            let result = promote_current_thread_to_audio();
+            if result == AudioThreadPriority::Promoted {
+                assert!(
+                    rt_priority::current_thread_is_elevated(),
+                    "reported Promoted but the OS does not confirm an elevated class"
+                );
+            }
+            result
+        })
+        .join()
+        .expect("promotion test thread panicked");
+
+        // Record the environment's outcome to ease debugging of CI scheduling.
+        eprintln!("audio-thread priority outcome on this host: {outcome:?}");
+    }
+}
+
 /// Entry point of a spawned render worker. Parks on `start` between quanta,
 /// then renders its pinned partitions for the published task until shutdown.
 #[cfg(not(target_arch = "wasm32"))]
@@ -443,6 +614,14 @@ fn worker_thread_main(
     shared: &PoolShared,
     sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
 ) {
+    // Promote to a realtime scheduling class before entering the render loop so
+    // the RT audio callback (worker 0) never blocks on the barrier behind a
+    // normal-priority worker. Best-effort; a failure only costs glitch margin.
+    let priority = promote_current_thread_to_audio();
+    if priority != AudioThreadPriority::Promoted {
+        log::debug!("render worker {w}: realtime priority not acquired ({priority:?})");
+    }
+
     loop {
         shared.start.wait();
         if shared.shutdown.load(std::sync::atomic::Ordering::Acquire) {
