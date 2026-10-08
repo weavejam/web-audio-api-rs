@@ -174,7 +174,47 @@ pub trait AudioProcessor: Send {
         false
     }
 
+    /// The thread-affinity constraint this processor places on the multicore
+    /// render executor.
+    ///
+    /// Defaults to [`ThreadAffinity::Any`] (may run on any render worker).
+    /// Override to [`ThreadAffinity::RenderThread`] for processors that bridge to
+    /// foreign code asserting a stable calling thread — e.g. a CLAP plugin whose
+    /// `process` checks it is always invoked from the same OS thread. Without
+    /// this, a graph edit could move the node's partition to a different worker
+    /// between quanta and trip that assertion. The serial path is unaffected: it
+    /// already runs every node on the render origin thread.
+    ///
+    /// Only read by the native render executor; wasm has no worker pool.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn thread_affinity(&self) -> ThreadAffinity {
+        ThreadAffinity::Any
+    }
+
     fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {}
+}
+
+/// Scheduling constraint a processor places on the multicore render executor.
+///
+/// Most processors are thread-agnostic and may run on any render worker. Some —
+/// notably ones that bridge to a foreign plugin that asserts it is always called
+/// from the same OS thread — must see a stable thread across quanta even as the
+/// graph is edited and the partition plan is recomputed.
+// On wasm there is no render worker pool, so the executor code that reads this
+// affinity is compiled out and only the trait default (constructing `Any`)
+// remains — which rustc flags as unused. The type is live on every native
+// target.
+#[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ThreadAffinity {
+    /// No constraint: may run on any render worker (the default).
+    #[default]
+    Any,
+    /// Must always run on the render origin thread (worker 0 — in live playback
+    /// the audio callback thread). That is the one thread whose identity never
+    /// changes across partition replans or worker-pool resizes, and the thread
+    /// the serial path already uses for every node.
+    RenderThread,
 }
 
 impl std::fmt::Debug for dyn AudioProcessor {

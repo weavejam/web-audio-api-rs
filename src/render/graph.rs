@@ -15,6 +15,8 @@ use smallvec::{smallvec, SmallVec};
 use super::node_collection::AudioNodeIdSet;
 #[cfg(not(target_arch = "wasm32"))]
 use super::BoundarySignal;
+#[cfg(not(target_arch = "wasm32"))]
+use super::ThreadAffinity;
 use super::{Alloc, AudioParamValues, AudioProcessor, AudioRenderQuantum, NodeCollection};
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 use crate::render::AudioWorkletGlobalScope;
@@ -1440,6 +1442,28 @@ impl Graph {
             }
         }
 
+        // Thread-affinity override: any partition containing a node that demands
+        // a stable calling thread (`ThreadAffinity::RenderThread`, e.g. some CLAP
+        // plugins) is pinned to worker 0 — the render origin thread, whose OS
+        // identity is invariant across partition replans and pool resizes. This
+        // keeps such a node on one thread for its whole lifetime even as the
+        // graph is edited, at the cost of folding its partition back onto the
+        // serial-equivalent thread. Output stays byte-identical (worker pinning
+        // never affects the fold order).
+        for (pidx, part) in plan.partitions.iter().enumerate() {
+            let pins_to_origin = part.iter().any(|&id| {
+                self.nodes
+                    .get_unchecked(id)
+                    .borrow()
+                    .processor
+                    .thread_affinity()
+                    == ThreadAffinity::RenderThread
+            });
+            if pins_to_origin {
+                partition_worker[pidx] = 0;
+            }
+        }
+
         let allocs = &self.worker_allocs;
         for (pidx, part) in plan.partitions.iter().enumerate() {
             let w = partition_worker[pidx];
@@ -2268,6 +2292,176 @@ mod tests {
                 used_workers >= workers.min(6),
                 "partitions should spread across available workers"
             );
+        }
+    }
+
+    // A node reporting `ThreadAffinity::RenderThread` must always run on worker 0
+    // — the render origin (calling) thread — even as the graph is edited and the
+    // partition plan is recomputed between quanta. Without the pin, a replan's
+    // round-robin could migrate its partition onto a spawned worker, tripping the
+    // foreign-code thread assertion it stands in for (e.g. a CLAP plugin).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_thread_affinity_pins_to_render_thread_across_replans() {
+        use crate::render::ThreadAffinity;
+        use std::cell::Cell;
+        use std::sync::{Arc, Mutex};
+        use std::thread::ThreadId;
+
+        #[derive(Debug, Clone)]
+        struct ConstSource {
+            value: f32,
+        }
+        impl AudioProcessor for ConstSource {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s = self.value);
+                true
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct PassThrough;
+        impl AudioProcessor for PassThrough {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0] = inputs[0].clone();
+                true
+            }
+        }
+
+        // A source that records the OS thread it is processed on each quantum and
+        // demands to always run on the render origin thread.
+        #[derive(Clone)]
+        struct Pinned {
+            value: f32,
+            threads: Arc<Mutex<Vec<ThreadId>>>,
+        }
+        impl std::fmt::Debug for Pinned {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("Pinned")
+            }
+        }
+        impl AudioProcessor for Pinned {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                self.threads
+                    .lock()
+                    .unwrap()
+                    .push(std::thread::current().id());
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s = self.value);
+                true
+            }
+            fn thread_affinity(&self) -> ThreadAffinity {
+                ThreadAffinity::RenderThread
+            }
+        }
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        const PINNED_ID: u64 = 2;
+        let threads = Arc::new(Mutex::new(Vec::new()));
+
+        // Destination merge (0) + a listener (1) to keep the graph alive, a
+        // pinned source (2), and four plain sources — each a cut edge into the
+        // merge, so the layer-0 partitions spread across workers.
+        let mut g = Graph::new(llq::Queue::new().split().0);
+        g.parallel_workers = 4;
+        add_node(&mut g, 0, Box::new(PassThrough));
+        add_node(&mut g, 1, Box::new(TestNode { tail_time: true }));
+        add_node(
+            &mut g,
+            PINNED_ID,
+            Box::new(Pinned {
+                value: 0.25,
+                threads: Arc::clone(&threads),
+            }),
+        );
+        add_edge(&mut g, PINNED_ID, 0);
+        for i in 0..4u64 {
+            let src = 10 + i;
+            add_node(&mut g, src, Box::new(ConstSource { value: i as f32 }));
+            add_edge(&mut g, src, 0);
+        }
+
+        // worker 0 runs on *this* thread (the caller acts as worker 0).
+        let origin = std::thread::current().id();
+
+        // Render, forcing a partition replan before each pass by editing the
+        // graph (adding a fresh source chain → `partition_plan = None`).
+        for pass in 0..4u64 {
+            if pass > 0 {
+                let src = 100 + pass;
+                add_node(&mut g, src, Box::new(ConstSource { value: pass as f32 }));
+                add_edge(&mut g, src, 0);
+            }
+            threads.lock().unwrap().clear();
+
+            let _ = g.render_partitioned_threaded(&scope);
+
+            let plan = g
+                .partition_plan
+                .as_ref()
+                .expect("plan cached (no nodes dropped)");
+            assert!(plan.well_formed);
+
+            // The pinned node's partition must be assigned to worker 0.
+            let pinned_part = plan
+                .partitions
+                .iter()
+                .position(|p| p.contains(&AudioNodeId(PINNED_ID)))
+                .expect("pinned node must live in some partition");
+            assert_eq!(
+                plan.partition_worker[pinned_part], 0,
+                "pass {pass}: pinned partition must be assigned to worker 0"
+            );
+
+            // Genuinely multi-worker, so the pin is doing real work.
+            let used = plan
+                .partition_worker
+                .iter()
+                .copied()
+                .collect::<std::collections::HashSet<_>>()
+                .len();
+            assert!(used > 1, "pass {pass}: graph should span multiple workers");
+
+            // And the processor was in fact only ever called on worker 0's
+            // (this) thread.
+            let recorded = threads.lock().unwrap();
+            assert!(!recorded.is_empty(), "pass {pass}: pinned node must run");
+            for &tid in recorded.iter() {
+                assert_eq!(
+                    tid, origin,
+                    "pass {pass}: pinned node ran on a non-origin thread"
+                );
+            }
         }
     }
 }
