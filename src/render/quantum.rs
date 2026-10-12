@@ -1,81 +1,111 @@
 //! Optimized audio signal data structures, used in `AudioProcessors`
 use arrayvec::ArrayVec;
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::cell::{Cell, RefCell};
+use std::sync::atomic::{fence, Ordering};
+use std::sync::Arc;
 
 use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
 
 use crate::assert_valid_number_of_channels;
 use crate::{MAX_CHANNELS, RENDER_QUANTUM_SIZE};
 
-// object pool for `AudioRenderQuantumChannel`s, only allocate if the pool is empty
-pub(crate) struct Alloc {
-    inner: Rc<AllocInner>,
+type Block = [f32; RENDER_QUANTUM_SIZE];
+
+/// The samples every silent channel reads; silence never holds a buffer.
+static ZEROES: Block = [0.; RENDER_QUANTUM_SIZE];
+
+thread_local! {
+    /// Per-thread pool of released buffers, reused before allocating.
+    ///
+    /// Buffers are fungible, so a channel does not remember where it came from:
+    /// it is allocated from, and released to, the pool of whichever thread it
+    /// is on at that moment. Under the multicore executor a buffer held in
+    /// processor state (a delay line, a compressor look-ahead) can move to
+    /// another worker with its node after a re-plan; it then simply joins that
+    /// worker's pool. No pool is ever shared between threads, so no locking.
+    static POOL: RefCell<Vec<Arc<Block>>> = const { RefCell::new(Vec::new()) };
+
+    /// Whether this thread's pool has been pre-filled (see [`Alloc::prewarm`]).
+    static PREWARMED: Cell<bool> = const { Cell::new(false) };
 }
 
-#[derive(Debug)]
-struct AllocInner {
-    pool: RefCell<Vec<Rc<[f32; RENDER_QUANTUM_SIZE]>>>,
-    zeroes: Rc<[f32; RENDER_QUANTUM_SIZE]>,
+fn pool_allocate() -> Arc<Block> {
+    POOL.try_with(|pool| pool.borrow_mut().pop())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| Arc::new([0.; RENDER_QUANTUM_SIZE]))
 }
+
+fn pool_release(block: Arc<Block>) {
+    // During thread teardown the pool may already be gone: then just free it.
+    let _ = POOL.try_with(move |pool| pool.borrow_mut().push(block));
+}
+
+/// Mutable access to a buffer this handle is the only owner of.
+///
+/// No `Weak` is ever created for a pooled buffer, so a strong count of 1 means
+/// this is the only handle in existence and no other thread can reach the
+/// buffer. The `Acquire` fence pairs with the `Release` decrement of the last
+/// other handle (possibly dropped on another thread), so its accesses happen
+/// before ours. This is `Arc::get_mut` without its compare-and-swap on the
+/// weak count, which matters on the per-quantum hot path.
+#[inline]
+fn unique_mut(block: &mut Arc<Block>) -> &mut Block {
+    debug_assert_eq!(Arc::strong_count(block), 1);
+    debug_assert_eq!(Arc::weak_count(block), 0);
+    fence(Ordering::Acquire);
+    // SAFETY: see above - this handle is the unique owner of the allocation.
+    unsafe { &mut *(Arc::as_ptr(block) as *mut Block) }
+}
+
+/// Handle to the render buffer pool of the current thread.
+///
+/// The pool itself is thread local (see `POOL`); this type only keeps the
+/// allocation API in one place.
+pub(crate) struct Alloc;
 
 impl Alloc {
+    /// Make sure the current thread's pool holds at least `n` buffers.
     pub fn with_capacity(n: usize) -> Self {
-        let pool: Vec<_> = (0..n).map(|_| Rc::new([0.; RENDER_QUANTUM_SIZE])).collect();
-        let zeroes = Rc::new([0.; RENDER_QUANTUM_SIZE]);
+        POOL.with(|pool| {
+            let mut pool = pool.borrow_mut();
+            while pool.len() < n {
+                pool.push(Arc::new([0.; RENDER_QUANTUM_SIZE]));
+            }
+        });
+        Self
+    }
 
-        let inner = AllocInner {
-            pool: RefCell::new(pool),
-            zeroes,
-        };
-
-        Self {
-            inner: Rc::new(inner),
+    /// Pre-fill the calling thread's pool with `n` buffers, once per thread, so
+    /// a render thread does not allocate in its first quanta. Cheap to call on
+    /// every quantum.
+    pub fn prewarm(n: usize) {
+        if !PREWARMED.with(Cell::get) {
+            PREWARMED.with(|p| p.set(true));
+            Self::with_capacity(n);
         }
     }
 
     #[cfg(test)]
     pub fn allocate(&self) -> AudioRenderQuantumChannel {
         AudioRenderQuantumChannel {
-            data: self.inner.allocate(),
-            alloc: Rc::clone(&self.inner),
+            data: Some(pool_allocate()),
         }
     }
 
     pub fn silence(&self) -> AudioRenderQuantumChannel {
-        AudioRenderQuantumChannel {
-            data: Rc::clone(&self.inner.zeroes),
-            alloc: Rc::clone(&self.inner),
-        }
+        AudioRenderQuantumChannel { data: None }
     }
 
     #[cfg(test)]
     pub fn pool_size(&self) -> usize {
-        self.inner.pool.borrow().len()
-    }
-}
-
-impl AllocInner {
-    fn allocate(&self) -> Rc<[f32; RENDER_QUANTUM_SIZE]> {
-        if let Some(rc) = self.pool.borrow_mut().pop() {
-            // reuse from pool
-            rc
-        } else {
-            // allocate
-            Rc::new([0.; RENDER_QUANTUM_SIZE])
-        }
-    }
-
-    fn push(&self, data: Rc<[f32; RENDER_QUANTUM_SIZE]>) {
-        self.pool
-            .borrow_mut() // infallible when single threaded
-            .push(data);
+        POOL.with(|pool| pool.borrow().len())
     }
 }
 
 /// Render thread channel buffer
 ///
-/// Basically wraps a `Rc<[f32; render_quantum_size]>`, which means it derefs to a (mutable) slice
+/// Basically wraps an `Arc<[f32; render_quantum_size]>`, which means it derefs to a (mutable) slice
 /// of `[f32]` sample values. Plus it has copy-on-write semantics, so it is cheap to clone.
 ///
 /// The `render_quantum_size` is equal to 128 by default, but in future versions it may be equal to
@@ -83,31 +113,44 @@ impl AllocInner {
 ///
 /// # Usage
 ///
-/// Audio buffers are managed with a dedicated allocator per render thread, hence there are no
+/// Audio buffers are managed with a pool per render thread, hence there are no
 /// public constructors available. If you must create a new instance, copy an existing one and
 /// mutate it from there.
 #[derive(Clone, Debug)]
 pub struct AudioRenderQuantumChannel {
-    data: Rc<[f32; RENDER_QUANTUM_SIZE]>,
-    alloc: Rc<AllocInner>,
+    /// `None` is silence: it reads as [`ZEROES`] and costs nothing to clone.
+    data: Option<Arc<Block>>,
 }
 
 impl AudioRenderQuantumChannel {
-    fn make_mut(&mut self) -> &mut [f32; RENDER_QUANTUM_SIZE] {
-        if Rc::strong_count(&self.data) != 1 {
-            let mut new = self.alloc.allocate();
-            Rc::make_mut(&mut new).copy_from_slice(self.data.deref());
-            self.data = new;
+    fn make_mut(&mut self) -> &mut Block {
+        let shared = match &self.data {
+            Some(block) => Arc::strong_count(block) != 1,
+            None => true,
+        };
+        if shared {
+            let mut new = pool_allocate();
+            // a pooled buffer is dirty: always overwrite it
+            unique_mut(&mut new).copy_from_slice(self.deref());
+            self.data = Some(new);
         }
 
-        Rc::make_mut(&mut self.data)
+        unique_mut(self.data.as_mut().unwrap())
     }
 
     /// `O(1)` check if this buffer is equal to the 'silence buffer'
     ///
     /// If this function returns false, it is still possible for all samples to be zero.
     pub(crate) fn is_silent(&self) -> bool {
-        Rc::ptr_eq(&self.data, &self.alloc.zeroes)
+        self.data.is_none()
+    }
+
+    /// Identity of the backing buffer (all silent channels share one).
+    fn data_ptr(&self) -> *const f32 {
+        match &self.data {
+            Some(block) => Arc::as_ptr(block) as *const f32,
+            None => ZEROES.as_ptr(),
+        }
     }
 
     /// Sum two channels
@@ -120,10 +163,7 @@ impl AudioRenderQuantumChannel {
     }
 
     pub(crate) fn silence(&self) -> Self {
-        Self {
-            data: Rc::clone(&self.alloc.zeroes),
-            alloc: Rc::clone(&self.alloc),
-        }
+        Self { data: None }
     }
 }
 
@@ -133,7 +173,10 @@ impl Deref for AudioRenderQuantumChannel {
     type Target = [f32];
 
     fn deref(&self) -> &Self::Target {
-        self.data.as_slice()
+        match &self.data {
+            Some(block) => block.as_slice(),
+            None => ZEROES.as_slice(),
+        }
     }
 }
 
@@ -145,16 +188,18 @@ impl DerefMut for AudioRenderQuantumChannel {
 
 impl AsRef<[f32]> for AudioRenderQuantumChannel {
     fn as_ref(&self) -> &[f32] {
-        &self.data[..]
+        self.deref()
     }
 }
 
 impl std::ops::Drop for AudioRenderQuantumChannel {
     fn drop(&mut self) {
-        if Rc::strong_count(&self.data) == 1 {
-            let zeroes = Rc::clone(&self.alloc.zeroes);
-            let rc = std::mem::replace(&mut self.data, zeroes);
-            self.alloc.push(rc);
+        if let Some(block) = self.data.take() {
+            // A count of 1 means this is the only handle (no `Weak`s exist), so
+            // no other thread can be cloning it concurrently.
+            if Arc::strong_count(&block) == 1 {
+                pool_release(block);
+            }
         }
     }
 }
@@ -579,7 +624,7 @@ impl AudioRenderQuantum {
         let mut channels = self.channels.iter();
         let first = channels.next().unwrap();
         for c in channels {
-            if !Rc::ptr_eq(&first.data, &c.data) {
+            if first.data_ptr() != c.data_ptr() {
                 return false;
             }
         }
@@ -591,8 +636,8 @@ impl AudioRenderQuantum {
     ///
     /// Used by the multicore render path to carry a cut-edge producer's output
     /// across a partition (hence thread) boundary. Unlike cloning an
-    /// `AudioRenderQuantum` — which shares an `Rc` into the producer thread's
-    /// buffer pool — this copies the raw samples so nothing `Rc`-backed ever
+    /// `AudioRenderQuantum` — which shares a buffer from the producer thread's
+    /// buffer pool — this copies the raw samples so no pooled buffer ever
     /// leaves the producing thread. It preserves two things that the summation
     /// at the merge node depends on for *byte-identical* output:
     ///   * which channels are silent (so `is_silent()` stays true after
@@ -601,8 +646,8 @@ impl AudioRenderQuantum {
     ///     `all_channels_identical()` — a pointer check — matches, keeping
     ///     `add`'s identical-channel fast path).
     ///
-    /// Both are captured by de-duplicating on the backing `Rc` pointer: silent
-    /// channels share the alloc's `zeroes` pointer, and up-mixed channels share
+    /// Both are captured by de-duplicating on the backing buffer pointer: silent
+    /// channels share the static zero block, and up-mixed channels share
     /// their source pointer.
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn to_boundary(&self) -> BoundarySignal {
@@ -611,7 +656,7 @@ impl AudioRenderQuantum {
         let mut group_ptrs: ArrayVec<*const f32, MAX_CHANNELS> = ArrayVec::new();
 
         for ch in &self.channels {
-            let ptr = Rc::as_ptr(&ch.data) as *const f32;
+            let ptr = ch.data_ptr();
             if let Some(gi) = group_ptrs.iter().position(|&p| p == ptr) {
                 channel_groups.push(gi as u8);
             } else {
@@ -621,7 +666,7 @@ impl AudioRenderQuantum {
                     groups.push(BoundaryGroup::Silent);
                 } else {
                     let mut data = Box::new([0.0f32; RENDER_QUANTUM_SIZE]);
-                    data.copy_from_slice(&ch.data[..]);
+                    data.copy_from_slice(&ch[..]);
                     groups.push(BoundaryGroup::Samples(data));
                 }
                 channel_groups.push(gi);
@@ -647,7 +692,7 @@ enum BoundaryGroup {
 
 /// A thread-safe, deep-copied snapshot of an [`AudioRenderQuantum`] used to
 /// transfer a cut-edge signal between render partitions running on different
-/// threads. Contains only plain data (no `Rc`), so it is `Send`. Rebuild an
+/// threads. Contains only plain data (no pooled buffer), so it is `Send`. Rebuild an
 /// `AudioRenderQuantum` on the consuming thread's allocator with
 /// [`Alloc::boundary_to_quantum`].
 #[cfg(not(target_arch = "wasm32"))]
@@ -666,18 +711,17 @@ impl Alloc {
     /// silence structure so a subsequent `add` is byte-identical to the serial
     /// render. See [`AudioRenderQuantum::to_boundary`].
     pub(crate) fn boundary_to_quantum(&self, b: &BoundarySignal) -> AudioRenderQuantum {
-        // Materialize one channel per distinct group, then clone (share Rc) for
+        // Materialize one channel per distinct group, then clone (share the buffer) for
         // every channel that maps to it.
         let mut group_channels: ArrayVec<AudioRenderQuantumChannel, MAX_CHANNELS> = ArrayVec::new();
         for g in &b.groups {
             match g {
                 BoundaryGroup::Silent => group_channels.push(self.silence()),
                 BoundaryGroup::Samples(data) => {
-                    let mut ch = self.silence();
-                    // `make_mut` on silence (shared `zeroes`) allocates a fresh
-                    // buffer from this pool; then overwrite it with the samples.
-                    ch.make_mut().copy_from_slice(&data[..]);
-                    group_channels.push(ch);
+                    // a fresh buffer from this thread's pool, overwritten with the samples
+                    let mut block = pool_allocate();
+                    unique_mut(&mut block).copy_from_slice(&data[..]);
+                    group_channels.push(AudioRenderQuantumChannel { data: Some(block) });
                 }
             }
         }
@@ -836,7 +880,7 @@ mod tests {
     #[test]
     fn test_add_preserves_aliased_channels_beyond_stereo() {
         // ChannelMerger outputs quanta whose N channels all point at the same
-        // Rc when several inputs are fed from one upstream node. The
+        // buffer when several inputs are fed from one upstream node. The
         // identical-channels fast path in add() cannot tell such quanta apart
         // from genuine mono up-mixes; collapsing them to mono and re-mixing
         // wipes channels 1..N to silence for channel counts > 2 (the speakers

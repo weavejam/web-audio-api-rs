@@ -66,6 +66,11 @@ pub struct Node {
     has_inputs_connected: bool,
     /// Indicates if the node can act as a cycle breaker (only DelayNode for now)
     cycle_breaker: bool,
+    /// The nodes this cycle breaker was linked to before its outgoing edges were
+    /// cleared to break a cycle (a DelayNode writer -> its reader). The two halves
+    /// share processor state (the delay line) with no graph edge left between
+    /// them, so the partition planner must keep them on the same render thread.
+    cycle_break_partners: SmallVec<[AudioNodeId; 1]>,
 }
 
 impl std::fmt::Debug for Node {
@@ -158,11 +163,6 @@ pub(crate) struct Graph {
     /// construction from `WEB_AUDIO_RS_PARALLEL` (native only). Byte-identical to
     /// serial regardless of worker count.
     parallel_workers: usize,
-    /// One buffer-pool allocator per worker thread, created lazily on first
-    /// threaded render. Each partition's node buffers are rebased onto the
-    /// allocator of its pinned worker so no pool is touched by two threads.
-    #[cfg(not(target_arch = "wasm32"))]
-    worker_allocs: Vec<Alloc>,
     /// Persistent pool of render worker threads, spawned once on the first
     /// threaded render and parked on a barrier between quanta. Rebuilt only when
     /// the worker count changes; torn down on drop. Spawning threads *per
@@ -248,12 +248,12 @@ struct PartitionPlan {
     /// dependency and may render concurrently; layers run in order. Used only by
     /// the threaded executor ([`Graph::render_partitioned_threaded`]).
     layers: Vec<Vec<usize>>,
-    /// For each partition index, the worker thread it is pinned to (static pin;
-    /// its node buffers are rebased onto that worker's allocator). Empty until
-    /// the threaded executor assigns workers; the serial path ignores it.
+    /// For each partition index, the worker thread it is pinned to (static pin).
+    /// Empty until the threaded executor assigns workers; the serial path
+    /// ignores it.
     partition_worker: Vec<usize>,
     /// Number of workers `partition_worker` was assigned for. `0` means "not yet
-    /// assigned / needs (re)assigning & buffer rebase".
+    /// assigned".
     assigned_workers: usize,
     /// Dense, indexed by `AudioNodeId.0`: whether the node is a merge node (its
     /// audio inputs are assembled via `merge_lookup`, never pushed into directly).
@@ -308,7 +308,7 @@ impl UnionFind {
 /// Per-quantum render task, published by the main thread into [`PoolShared`]
 /// before releasing the workers. All fields are plain `Copy` data (raw pointers
 /// and scalars); they point at render state that lives for the whole quantum:
-/// `nodes`/`worker_allocs` are `Graph` fields, while `plan`/`boundary` are
+/// `nodes` is a `Graph` field, while `plan`/`boundary` are
 /// locals of [`Graph::render_partitioned_threaded`] that outlive the fork/join.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
@@ -316,8 +316,6 @@ struct PoolTask {
     nodes: *const NodeCollection,
     plan: *const PartitionPlan,
     boundary: *mut Option<BoundarySignal>,
-    /// Base of the `worker_allocs` slice; worker `w` uses `allocs.add(w)`.
-    allocs: *const Alloc,
     frame: u64,
     time: f64,
     sample_rate: f32,
@@ -329,7 +327,6 @@ impl PoolTask {
         nodes: std::ptr::null(),
         plan: std::ptr::null(),
         boundary: std::ptr::null_mut(),
-        allocs: std::ptr::null(),
         frame: 0,
         time: 0.0,
         sample_rate: 0.0,
@@ -350,12 +347,19 @@ impl PoolTask {
 ///   producer's boundary write (earlier level) before a merge's read (later
 ///   level), and — on its final wait — the workers' `slots` writes before the
 ///   main thread reads them.
-/// * Disjointness: every node (and its buffers, rebased onto one worker's
-///   allocator) is touched by exactly one worker; `AudioParam`/listener nodes
-///   are union-ed into the partition they feed; each `boundary` slot has one
-///   producer; each `slots[w]` is written only by worker `w`. So no
-///   `RefCell<Node>`, buffer pool, boundary slot, or free-list is ever touched
-///   by two threads at once.
+/// * Disjointness: every node is touched by exactly one worker per quantum;
+///   `AudioParam`/listener nodes are union-ed into the partition they feed, and
+///   the two halves of a cycle-broken DelayNode (which share processor state
+///   with no graph edge left between them) into one partition; each `boundary`
+///   slot has one producer; each `slots[w]` is written only by worker `w`. So no
+///   `RefCell<Node>`, shared processor state, boundary slot, or free-list is
+///   ever touched by two threads at once.
+/// * Buffers: render buffers are not tied to a pool. A worker allocates from
+///   and releases to its own thread-local pool, so a buffer kept in processor
+///   state that moves to another worker with its node after a re-plan just
+///   joins that worker's pool. Buffer reference counts are atomic (`Arc`), as
+///   two nodes' processor states may still share one buffer after a re-plan
+///   splits them across workers.
 #[cfg(not(target_arch = "wasm32"))]
 struct PoolShared {
     /// Quantum-start rendezvous: `n_workers` parties (main + spawned workers).
@@ -625,6 +629,8 @@ fn worker_thread_main(
     if priority != AudioThreadPriority::Promoted {
         log::debug!("render worker {w}: realtime priority not acquired ({priority:?})");
     }
+    // Fill this worker's buffer pool before the first quantum.
+    Alloc::prewarm(64);
 
     loop {
         shared.start.wait();
@@ -638,7 +644,7 @@ fn worker_thread_main(
         // doc); this worker only reaches nodes/buffers in its own partitions.
         let nodes: &NodeCollection = unsafe { &*task.nodes };
         let plan: &PartitionPlan = unsafe { &*task.plan };
-        let alloc: &Alloc = unsafe { &*task.allocs.add(w) };
+        let alloc = &Alloc;
 
         let scope = AudioWorkletGlobalScope {
             current_frame: task.frame,
@@ -821,8 +827,6 @@ impl Graph {
             partitioned,
             parallel_workers,
             #[cfg(not(target_arch = "wasm32"))]
-            worker_allocs: Vec::new(),
-            #[cfg(not(target_arch = "wasm32"))]
             pool: None,
         }
     }
@@ -932,6 +936,7 @@ impl Graph {
                 control_handle_dropped: false,
                 has_inputs_connected: false,
                 cycle_breaker: false,
+                cycle_break_partners: smallvec![],
             }),
         );
 
@@ -1139,12 +1144,15 @@ impl Graph {
             }
 
             if cycle_breaker_applied {
-                // clear the outgoing edges of the nodes that have been recognized as cycle breaker
+                // clear the outgoing edges of the nodes that have been recognized as cycle breaker,
+                // remembering who they fed so the partitioner can keep both halves together
                 cycle_breakers.iter().for_each(|node_id| {
-                    self.nodes
-                        .get_unchecked_mut(*node_id)
-                        .outgoing_edges
-                        .clear();
+                    let node = self.nodes.get_unchecked_mut(*node_id);
+                    for edge in node.outgoing_edges.drain(..) {
+                        if !node.cycle_break_partners.contains(&edge.other_id) {
+                            node.cycle_break_partners.push(edge.other_id);
+                        }
+                    }
                 });
 
                 continue;
@@ -1174,6 +1182,10 @@ impl Graph {
     /// Both produce byte-identical output. This is the entry point the render
     /// thread should call.
     pub fn render_quantum(&mut self, scope: &AudioWorkletGlobalScope) -> &AudioRenderQuantum {
+        // Fill this (render) thread's buffer pool once, so it does not allocate
+        // in its first quanta. A no-op after the first call on a thread.
+        Alloc::prewarm(64);
+
         #[cfg(not(target_arch = "wasm32"))]
         if self.parallel_workers >= 2 {
             return self.render_partitioned_threaded(scope);
@@ -1266,9 +1278,9 @@ impl Graph {
                     // Check if this node was connected to the dropped node. In that case, it is
                     // either an AudioParam or the AudioListener that feeds into a PannerNode.
                     // These should be disconnected
-                    node.get_mut()
-                        .outgoing_edges
-                        .retain(|e| e.other_id != *index);
+                    let node = node.get_mut();
+                    node.outgoing_edges.retain(|e| e.other_id != *index);
+                    node.cycle_break_partners.retain(|p| p != index);
                 });
             }
         });
@@ -1331,6 +1343,28 @@ impl Graph {
                 }
                 // else: audio edge into a merge node -> cut (boundary)
             }
+        }
+
+        // 2b. Keep both halves of a cycle-broken DelayNode together. Breaking the
+        //     cycle cleared the writer's edge to its reader, but the two still
+        //     share the delay line (an `Rc<RefCell<..>>` plus the frame counters
+        //     that order writer and reader), so they must run on the same thread,
+        //     in serial order. Linking them can close a loop in the partition DAG
+        //     (the feedback path through another partition back into the writer),
+        //     so such loops are then collapsed into single partitions.
+        let mut linked_partners = false;
+        for id in self.nodes.keys() {
+            let node = self.nodes.get_unchecked(id).borrow();
+            for &partner in &node.cycle_break_partners {
+                let p = partner.0 as usize;
+                if p < cap && self.nodes.contains(partner) {
+                    uf.union(id.0 as usize, p);
+                    linked_partners = true;
+                }
+            }
+        }
+        if linked_partners {
+            self.collapse_partition_cycles(&mut uf, &is_merge, cap);
         }
 
         // 3. Group nodes by component, in `ordered` sequence (so each partition's
@@ -1463,6 +1497,104 @@ impl Graph {
         }
     }
 
+    /// Merge every strongly connected set of partitions (components of `uf`)
+    /// into one partition, so the partition DAG built from `uf` is acyclic.
+    ///
+    /// Partition edges are the cut edges (audio edges into a merge node); all
+    /// other edges are already inside a component. Only nodes in `ordered` take
+    /// part, mirroring how [`Graph::compute_partition_plan`] builds the DAG.
+    /// Iterative Kosaraju, so a deep graph cannot overflow the render thread's
+    /// stack.
+    fn collapse_partition_cycles(&self, uf: &mut UnionFind, is_merge: &[bool], cap: usize) {
+        let mut in_ordered = vec![false; cap];
+        for &id in &self.ordered {
+            in_ordered[id.0 as usize] = true;
+        }
+
+        // Dense group ids for the components of ordered nodes, with one
+        // representative node per group to union through.
+        let mut group_of_root = vec![usize::MAX; cap];
+        let mut rep: Vec<usize> = Vec::new();
+        for &id in &self.ordered {
+            let root = uf.find(id.0 as usize);
+            if group_of_root[root] == usize::MAX {
+                group_of_root[root] = rep.len();
+                rep.push(id.0 as usize);
+            }
+        }
+        let n = rep.len();
+
+        let mut adj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for &id in &self.ordered {
+            let from = group_of_root[uf.find(id.0 as usize)];
+            let node = self.nodes.get_unchecked(id).borrow();
+            for edge in &node.outgoing_edges {
+                let to_node = edge.other_id.0 as usize;
+                if edge.other_index == usize::MAX || !is_merge[to_node] || !in_ordered[to_node] {
+                    continue; // param edge, intra-component edge, or excluded consumer
+                }
+                let to = group_of_root[uf.find(to_node)];
+                if to != from {
+                    adj[from].push(to);
+                }
+            }
+        }
+
+        // Pass 1: post-order of a DFS over `adj`.
+        let mut visited = vec![false; n];
+        let mut post: Vec<usize> = Vec::with_capacity(n);
+        for start in 0..n {
+            if visited[start] {
+                continue;
+            }
+            visited[start] = true;
+            let mut stack: Vec<(usize, usize)> = vec![(start, 0)];
+            while let Some(top) = stack.last_mut() {
+                let v = top.0;
+                if let Some(&w) = adj[v].get(top.1) {
+                    top.1 += 1;
+                    if !visited[w] {
+                        visited[w] = true;
+                        stack.push((w, 0));
+                    }
+                } else {
+                    post.push(v);
+                    stack.pop();
+                }
+            }
+        }
+
+        // Pass 2: components of the reversed graph, in reverse post-order.
+        let mut radj: Vec<Vec<usize>> = vec![Vec::new(); n];
+        for (v, targets) in adj.iter().enumerate() {
+            for &w in targets {
+                radj[w].push(v);
+            }
+        }
+        let mut leader = vec![usize::MAX; n];
+        for &start in post.iter().rev() {
+            if leader[start] != usize::MAX {
+                continue;
+            }
+            leader[start] = start;
+            let mut stack = vec![start];
+            while let Some(v) = stack.pop() {
+                for &w in &radj[v] {
+                    if leader[w] == usize::MAX {
+                        leader[w] = start;
+                        stack.push(w);
+                    }
+                }
+            }
+        }
+
+        for v in 0..n {
+            if leader[v] != v {
+                uf.union(rep[v], rep[leader[v]]);
+            }
+        }
+    }
+
     /// Render a single audio quantum via the partition plan. Produces output that
     /// is byte-identical to [`Graph::render`]. This implementation runs partitions
     /// *serially* (in topological order); it is the correctness-equivalence proof
@@ -1578,9 +1710,9 @@ impl Graph {
                     nodes_dropped = true;
 
                     self.nodes.values_mut().for_each(|node| {
-                        node.get_mut()
-                            .outgoing_edges
-                            .retain(|e| e.other_id != index);
+                        let node = node.get_mut();
+                        node.outgoing_edges.retain(|e| e.other_id != index);
+                        node.cycle_break_partners.retain(|p| *p != index);
                     });
                 }
             }
@@ -1606,13 +1738,13 @@ impl Graph {
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
     }
 
-    /// Assign each partition to a worker thread (static pin) and rebase every
-    /// node's input/output buffers onto that worker's allocator. After this, no
-    /// buffer pool is ever touched by two threads: a node only runs on its
-    /// partition's pinned worker, which owns the allocator its buffers came from.
-    /// Called once whenever the plan is (re)computed; cheap thereafter.
+    /// Assign each partition to a worker thread (static pin). A node only runs on
+    /// its partition's pinned worker. Render buffers need no re-homing: buffer
+    /// pools are thread local, so a buffer that moves with a re-pinned node
+    /// simply joins its new worker's pool (see the `PoolShared` safety notes).
+    /// Called once whenever the plan is (re)computed.
     #[cfg(not(target_arch = "wasm32"))]
-    fn assign_workers_and_rebase(&mut self, plan: &mut PartitionPlan, n_workers: usize) {
+    fn assign_workers(&self, plan: &mut PartitionPlan, n_workers: usize) {
         let n_parts = plan.partitions.len();
         let mut partition_worker = vec![0usize; n_parts];
         // Round-robin partitions to workers *within each layer*, so each layer's
@@ -1645,20 +1777,6 @@ impl Graph {
             }
         }
 
-        let allocs = &self.worker_allocs;
-        for (pidx, part) in plan.partitions.iter().enumerate() {
-            let w = partition_worker[pidx];
-            for &id in part {
-                let node = self.nodes.get_unchecked_mut(id);
-                for buf in node.inputs.iter_mut() {
-                    *buf = AudioRenderQuantum::from(allocs[w].silence());
-                }
-                for buf in node.outputs.iter_mut() {
-                    *buf = AudioRenderQuantum::from(allocs[w].silence());
-                }
-            }
-        }
-
         plan.partition_worker = partition_worker;
         plan.assigned_workers = n_workers;
     }
@@ -1670,8 +1788,8 @@ impl Graph {
     /// [`PartitionPlan`]) are statically pinned to worker threads and rendered a
     /// DAG-level at a time: all partitions in a level run concurrently, then a
     /// barrier, then the next level. Cross-partition (cut) edges are carried as
-    /// deep-copied [`BoundarySignal`]s — never an `Rc` — so each worker touches
-    /// only its own buffer pool. Merge nodes sum their boundary inputs in the
+    /// deep-copied [`BoundarySignal`]s, so partitions never share a buffer
+    /// through a cut edge. Merge nodes sum their boundary inputs in the
     /// exact `ordered` fold the serial path uses, so the result bits do not
     /// depend on the worker count. Native-only.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1680,10 +1798,12 @@ impl Graph {
         scope: &AudioWorkletGlobalScope,
     ) -> &AudioRenderQuantum {
         let n_workers = self.parallel_workers.max(2);
-        if self.worker_allocs.len() != n_workers {
-            self.worker_allocs = (0..n_workers).map(|_| Alloc::with_capacity(64)).collect();
-            // Allocator identities changed; any cached plan's buffer rebase is
-            // stale. Force a recompute + rebase.
+        if self
+            .partition_plan
+            .as_ref()
+            .is_some_and(|plan| plan.well_formed && plan.assigned_workers != n_workers)
+        {
+            // The worker count changed: the cached worker assignment is stale.
             self.partition_plan = None;
         }
 
@@ -1694,7 +1814,7 @@ impl Graph {
         if self.partition_plan.is_none() {
             let mut plan = self.compute_partition_plan();
             if plan.well_formed {
-                self.assign_workers_and_rebase(&mut plan, n_workers);
+                self.assign_workers(&mut plan, n_workers);
             }
             self.partition_plan = Some(plan);
         }
@@ -1724,7 +1844,7 @@ impl Graph {
             self.pool = Some(WorkerPool::new(n_workers, &scope.event_sender));
         }
         // Clone the Arc so no borrow of `self.pool` is held while we borrow
-        // `self.nodes`/`self.worker_allocs` for the render below.
+        // `self.nodes` for the render below.
         let shared = std::sync::Arc::clone(&self.pool.as_ref().unwrap().shared);
 
         // Publish this quantum's task, then release the parked workers. The raw
@@ -1737,7 +1857,6 @@ impl Graph {
                 nodes: &self.nodes,
                 plan: &plan,
                 boundary: boundary_base,
-                allocs: self.worker_allocs.as_ptr(),
                 frame: scope.current_frame,
                 time: scope.current_time,
                 sample_rate: scope.sample_rate,
@@ -1758,7 +1877,7 @@ impl Graph {
             0,
             &self.nodes,
             &plan,
-            &self.worker_allocs[0],
+            &self.alloc,
             boundary_base,
             &scope0,
             &shared,
@@ -1800,9 +1919,9 @@ impl Graph {
                 nodes_dropped = true;
 
                 self.nodes.values_mut().for_each(|node| {
-                    node.get_mut()
-                        .outgoing_edges
-                        .retain(|e| e.other_id != index);
+                    let node = node.get_mut();
+                    node.outgoing_edges.retain(|e| e.other_id != index);
+                    node.cycle_break_partners.retain(|p| *p != index);
                 });
             }
         }
@@ -1816,7 +1935,7 @@ impl Graph {
                     i += 1;
                 }
             }
-            // leave self.partition_plan == None -> recompute + rebase next quantum
+            // leave self.partition_plan == None -> recompute next quantum
         } else {
             self.partition_plan = Some(plan);
         }
@@ -2649,7 +2768,7 @@ mod tests {
     // A live graph edit between quanta must invalidate the cached partition plan,
     // and the threaded executor must then render the EDITED topology
     // byte-identically to the serial render of that same edited graph. Guards the
-    // "graph edits mid-render" path: a stale plan or an un-rebased worker buffer
+    // "graph edits mid-render" path: a stale plan or a stale worker assignment
     // would leak the pre-edit graph's output.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
@@ -2849,5 +2968,262 @@ mod tests {
                 "64-worker threaded render (quantum {q}) must be byte-identical to serial"
             );
         }
+    }
+
+    // Breaking a feedback cycle clears the DelayNode writer's edge to its reader,
+    // but the two halves share the delay line. The planner must keep them in one
+    // partition (one thread), also when the feedback path runs through another
+    // partition - which turns the writer/reader link into a partition-level
+    // cycle that has to be collapsed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_cycle_broken_delay_halves_share_a_partition() {
+        use std::cell::Cell;
+
+        #[derive(Debug, Clone)]
+        struct ConstSource {
+            value: f32,
+        }
+        impl AudioProcessor for ConstSource {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s = self.value);
+                true
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct Scale {
+            k: f32,
+        }
+        impl AudioProcessor for Scale {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                outputs[0] = inputs[0].clone();
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s *= self.k);
+                true
+            }
+        }
+
+        const WRITER: u64 = 3;
+        const READER: u64 = 4;
+
+        // dest(0) listener(1); src(2) -> writer(3) ~> reader(4) -> fb(5) -> writer,
+        // reader -> dest, plus an unrelated source (6) so there is more than one
+        // partition to spread. With `through_merge`, the feedback path detours
+        // through a merge node (7, also fed by source 8) in its own partition.
+        fn build(through_merge: bool) -> Graph {
+            let mut g = Graph::new(llq::Queue::new().split().0);
+            add_node(&mut g, 0, Box::new(Scale { k: 1.0 }));
+            add_node(&mut g, 1, Box::new(TestNode { tail_time: true }));
+            add_node(&mut g, 2, Box::new(ConstSource { value: 1.0 }));
+            add_node(&mut g, WRITER, Box::new(Scale { k: 1.0 }));
+            add_node(&mut g, READER, Box::new(Scale { k: 1.0 }));
+            add_node(&mut g, 5, Box::new(Scale { k: 0.5 }));
+            add_node(&mut g, 6, Box::new(ConstSource { value: 2.0 }));
+            g.mark_cycle_breaker(AudioNodeId(WRITER));
+            add_edge(&mut g, 2, WRITER);
+            add_edge(&mut g, WRITER, READER);
+            add_edge(&mut g, READER, 0);
+            add_edge(&mut g, 6, 0);
+            if through_merge {
+                add_node(&mut g, 7, Box::new(Scale { k: 0.25 }));
+                add_node(&mut g, 8, Box::new(ConstSource { value: 3.0 }));
+                add_edge(&mut g, READER, 7);
+                add_edge(&mut g, 8, 7);
+                add_edge(&mut g, 7, 5);
+            } else {
+                add_edge(&mut g, READER, 5);
+            }
+            add_edge(&mut g, 5, WRITER);
+            g
+        }
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        for through_merge in [false, true] {
+            let serial_bits: Vec<Vec<u32>> = {
+                let mut g = build(through_merge);
+                (0..4)
+                    .map(|_| {
+                        g.render(&scope)
+                            .channel_data(0)
+                            .iter()
+                            .map(|x| x.to_bits())
+                            .collect()
+                    })
+                    .collect()
+            };
+
+            for workers in [2usize, 4] {
+                let mut g = build(through_merge);
+                g.parallel_workers = workers;
+                for (q, expected) in serial_bits.iter().enumerate() {
+                    let got: Vec<u32> = g
+                        .render_partitioned_threaded(&scope)
+                        .channel_data(0)
+                        .iter()
+                        .map(|x| x.to_bits())
+                        .collect();
+                    assert_eq!(
+                        &got, expected,
+                        "through_merge={through_merge} workers={workers} quantum={q}: \
+                         threaded render must be byte-identical to serial"
+                    );
+                }
+
+                let plan = g.partition_plan.as_ref().expect("plan cached");
+                assert!(
+                    plan.well_formed,
+                    "through_merge={through_merge}: partition DAG must stay acyclic"
+                );
+                let partition_of = |id: u64| {
+                    plan.partitions
+                        .iter()
+                        .position(|p| p.contains(&AudioNodeId(id)))
+                        .expect("node is planned")
+                };
+                assert_eq!(
+                    partition_of(WRITER),
+                    partition_of(READER),
+                    "through_merge={through_merge}: delay writer and reader must share a partition"
+                );
+                assert!(
+                    plan.partitions.len() > 1,
+                    "co-locating the delay must not serialize the whole graph"
+                );
+            }
+        }
+    }
+
+    // Once the feedback path of a cycle-broken delay is removed, no edge links
+    // or orders the writer and reader any more (the cycle breaker's edges stay
+    // cleared), so both land on the first DAG level. They still share the delay
+    // line and must never run concurrently. The probes hold their "delay line"
+    // for 2 ms so an overlap on two workers is all but certain to be observed.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_detached_cycle_breaker_halves_never_run_concurrently() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+        use std::thread::ThreadId;
+
+        #[derive(Default)]
+        struct DelayLine {
+            busy: AtomicBool,
+            overlapped: AtomicBool,
+            threads: Mutex<Vec<(&'static str, ThreadId)>>,
+        }
+
+        struct Probe {
+            name: &'static str,
+            line: Arc<DelayLine>,
+        }
+        impl std::fmt::Debug for Probe {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct("Probe").field("name", &self.name).finish()
+            }
+        }
+        impl AudioProcessor for Probe {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                _scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                if self.line.busy.swap(true, Ordering::SeqCst) {
+                    self.line.overlapped.store(true, Ordering::SeqCst);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                self.line.busy.store(false, Ordering::SeqCst);
+                self.line
+                    .threads
+                    .lock()
+                    .unwrap()
+                    .push((self.name, std::thread::current().id()));
+                outputs[0] = inputs[0].clone();
+                true
+            }
+        }
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        let line = Arc::new(DelayLine::default());
+        let mut g = Graph::new(llq::Queue::new().split().0);
+        g.parallel_workers = 4;
+        // dest(0, merge of 4 and 6) listener(1); src(2) -> writer(3) ~> reader(4)
+        // -> fb(5) -> writer; reader -> dest; src(6) -> dest.
+        add_node(&mut g, 0, Box::new(TestNode { tail_time: true }));
+        add_node(&mut g, 1, Box::new(TestNode { tail_time: true }));
+        add_node(&mut g, 2, Box::new(TestNode { tail_time: true }));
+        let writer = Probe {
+            name: "writer",
+            line: Arc::clone(&line),
+        };
+        let reader = Probe {
+            name: "reader",
+            line: Arc::clone(&line),
+        };
+        add_node(&mut g, 3, Box::new(writer));
+        add_node(&mut g, 4, Box::new(reader));
+        add_node(&mut g, 5, Box::new(TestNode { tail_time: true }));
+        add_node(&mut g, 6, Box::new(TestNode { tail_time: true }));
+        g.mark_cycle_breaker(AudioNodeId(3));
+        add_edge(&mut g, 2, 3);
+        add_edge(&mut g, 3, 4);
+        add_edge(&mut g, 4, 5);
+        add_edge(&mut g, 5, 3);
+        add_edge(&mut g, 4, 0);
+        add_edge(&mut g, 6, 0);
+
+        // Break the cycle (clears the writer -> reader edge), then detach the
+        // feedback path so nothing orders the two halves any more.
+        g.render_partitioned_threaded(&scope);
+        g.remove_edge((AudioNodeId(5), 0), (AudioNodeId(3), 0));
+        line.threads.lock().unwrap().clear();
+        for _ in 0..8 {
+            g.render_partitioned_threaded(&scope);
+        }
+
+        assert!(
+            !line.overlapped.load(Ordering::SeqCst),
+            "delay writer and reader ran concurrently on different workers"
+        );
+        let threads = line.threads.lock().unwrap();
+        assert_eq!(threads.len(), 16, "both halves render every quantum");
+        assert!(
+            threads.iter().all(|&(_, t)| t == threads[0].1),
+            "delay writer and reader must stay on one thread: {threads:?}"
+        );
     }
 }
