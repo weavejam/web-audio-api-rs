@@ -163,11 +163,6 @@ pub(crate) struct Graph {
     /// construction from `WEB_AUDIO_RS_PARALLEL` (native only). Byte-identical to
     /// serial regardless of worker count.
     parallel_workers: usize,
-    /// One buffer-pool allocator per worker thread, created lazily on first
-    /// threaded render. Each partition's node buffers are rebased onto the
-    /// allocator of its pinned worker so no pool is touched by two threads.
-    #[cfg(not(target_arch = "wasm32"))]
-    worker_allocs: Vec<Alloc>,
     /// Persistent pool of render worker threads, spawned once on the first
     /// threaded render and parked on a barrier between quanta. Rebuilt only when
     /// the worker count changes; torn down on drop. Spawning threads *per
@@ -253,12 +248,12 @@ struct PartitionPlan {
     /// dependency and may render concurrently; layers run in order. Used only by
     /// the threaded executor ([`Graph::render_partitioned_threaded`]).
     layers: Vec<Vec<usize>>,
-    /// For each partition index, the worker thread it is pinned to (static pin;
-    /// its node buffers are rebased onto that worker's allocator). Empty until
-    /// the threaded executor assigns workers; the serial path ignores it.
+    /// For each partition index, the worker thread it is pinned to (static pin).
+    /// Empty until the threaded executor assigns workers; the serial path
+    /// ignores it.
     partition_worker: Vec<usize>,
     /// Number of workers `partition_worker` was assigned for. `0` means "not yet
-    /// assigned / needs (re)assigning & buffer rebase".
+    /// assigned".
     assigned_workers: usize,
     /// Dense, indexed by `AudioNodeId.0`: whether the node is a merge node (its
     /// audio inputs are assembled via `merge_lookup`, never pushed into directly).
@@ -313,7 +308,7 @@ impl UnionFind {
 /// Per-quantum render task, published by the main thread into [`PoolShared`]
 /// before releasing the workers. All fields are plain `Copy` data (raw pointers
 /// and scalars); they point at render state that lives for the whole quantum:
-/// `nodes`/`worker_allocs` are `Graph` fields, while `plan`/`boundary` are
+/// `nodes` is a `Graph` field, while `plan`/`boundary` are
 /// locals of [`Graph::render_partitioned_threaded`] that outlive the fork/join.
 #[cfg(not(target_arch = "wasm32"))]
 #[derive(Clone, Copy)]
@@ -321,8 +316,6 @@ struct PoolTask {
     nodes: *const NodeCollection,
     plan: *const PartitionPlan,
     boundary: *mut Option<BoundarySignal>,
-    /// Base of the `worker_allocs` slice; worker `w` uses `allocs.add(w)`.
-    allocs: *const Alloc,
     frame: u64,
     time: f64,
     sample_rate: f32,
@@ -334,7 +327,6 @@ impl PoolTask {
         nodes: std::ptr::null(),
         plan: std::ptr::null(),
         boundary: std::ptr::null_mut(),
-        allocs: std::ptr::null(),
         frame: 0,
         time: 0.0,
         sample_rate: 0.0,
@@ -362,12 +354,12 @@ impl PoolTask {
 ///   slot has one producer; each `slots[w]` is written only by worker `w`. So no
 ///   `RefCell<Node>`, shared processor state, boundary slot, or free-list is
 ///   ever touched by two threads at once.
-/// * Buffers: node inputs/outputs are rebased onto their worker's allocator,
-///   but buffers a processor keeps in its own state stay bound to the allocator
-///   they came from when a re-plan moves the node to another worker. Such a
-///   buffer may then be copied-on-write or released on a thread that does not
-///   own its pool, which is why the pool and buffer counts are thread safe
-///   (`Arc` + `try_lock`, see `Alloc`).
+/// * Buffers: render buffers are not tied to a pool. A worker allocates from
+///   and releases to its own thread-local pool, so a buffer kept in processor
+///   state that moves to another worker with its node after a re-plan just
+///   joins that worker's pool. Buffer reference counts are atomic (`Arc`), as
+///   two nodes' processor states may still share one buffer after a re-plan
+///   splits them across workers.
 #[cfg(not(target_arch = "wasm32"))]
 struct PoolShared {
     /// Quantum-start rendezvous: `n_workers` parties (main + spawned workers).
@@ -637,6 +629,8 @@ fn worker_thread_main(
     if priority != AudioThreadPriority::Promoted {
         log::debug!("render worker {w}: realtime priority not acquired ({priority:?})");
     }
+    // Fill this worker's buffer pool before the first quantum.
+    Alloc::prewarm(64);
 
     loop {
         shared.start.wait();
@@ -650,7 +644,7 @@ fn worker_thread_main(
         // doc); this worker only reaches nodes/buffers in its own partitions.
         let nodes: &NodeCollection = unsafe { &*task.nodes };
         let plan: &PartitionPlan = unsafe { &*task.plan };
-        let alloc: &Alloc = unsafe { &*task.allocs.add(w) };
+        let alloc = &Alloc;
 
         let scope = AudioWorkletGlobalScope {
             current_frame: task.frame,
@@ -832,8 +826,6 @@ impl Graph {
             partition_plan: None,
             partitioned,
             parallel_workers,
-            #[cfg(not(target_arch = "wasm32"))]
-            worker_allocs: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             pool: None,
         }
@@ -1190,6 +1182,10 @@ impl Graph {
     /// Both produce byte-identical output. This is the entry point the render
     /// thread should call.
     pub fn render_quantum(&mut self, scope: &AudioWorkletGlobalScope) -> &AudioRenderQuantum {
+        // Fill this (render) thread's buffer pool once, so it does not allocate
+        // in its first quanta. A no-op after the first call on a thread.
+        Alloc::prewarm(64);
+
         #[cfg(not(target_arch = "wasm32"))]
         if self.parallel_workers >= 2 {
             return self.render_partitioned_threaded(scope);
@@ -1742,15 +1738,13 @@ impl Graph {
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
     }
 
-    /// Assign each partition to a worker thread (static pin) and rebase every
-    /// node's input/output buffers onto that worker's allocator. A node only runs
-    /// on its partition's pinned worker, which owns the allocator its graph
-    /// buffers came from, so in the steady state each pool stays on one thread.
-    /// (Buffers held in processor state are not rebased; a re-pin can leave them
-    /// on another worker's pool, which the thread-safe `Alloc` tolerates.)
-    /// Called once whenever the plan is (re)computed; cheap thereafter.
+    /// Assign each partition to a worker thread (static pin). A node only runs on
+    /// its partition's pinned worker. Render buffers need no re-homing: buffer
+    /// pools are thread local, so a buffer that moves with a re-pinned node
+    /// simply joins its new worker's pool (see the `PoolShared` safety notes).
+    /// Called once whenever the plan is (re)computed.
     #[cfg(not(target_arch = "wasm32"))]
-    fn assign_workers_and_rebase(&mut self, plan: &mut PartitionPlan, n_workers: usize) {
+    fn assign_workers(&self, plan: &mut PartitionPlan, n_workers: usize) {
         let n_parts = plan.partitions.len();
         let mut partition_worker = vec![0usize; n_parts];
         // Round-robin partitions to workers *within each layer*, so each layer's
@@ -1783,20 +1777,6 @@ impl Graph {
             }
         }
 
-        let allocs = &self.worker_allocs;
-        for (pidx, part) in plan.partitions.iter().enumerate() {
-            let w = partition_worker[pidx];
-            for &id in part {
-                let node = self.nodes.get_unchecked_mut(id);
-                for buf in node.inputs.iter_mut() {
-                    *buf = AudioRenderQuantum::from(allocs[w].silence());
-                }
-                for buf in node.outputs.iter_mut() {
-                    *buf = AudioRenderQuantum::from(allocs[w].silence());
-                }
-            }
-        }
-
         plan.partition_worker = partition_worker;
         plan.assigned_workers = n_workers;
     }
@@ -1808,8 +1788,8 @@ impl Graph {
     /// [`PartitionPlan`]) are statically pinned to worker threads and rendered a
     /// DAG-level at a time: all partitions in a level run concurrently, then a
     /// barrier, then the next level. Cross-partition (cut) edges are carried as
-    /// deep-copied [`BoundarySignal`]s — never an `Rc` — so each worker touches
-    /// only its own buffer pool. Merge nodes sum their boundary inputs in the
+    /// deep-copied [`BoundarySignal`]s, so partitions never share a buffer
+    /// through a cut edge. Merge nodes sum their boundary inputs in the
     /// exact `ordered` fold the serial path uses, so the result bits do not
     /// depend on the worker count. Native-only.
     #[cfg(not(target_arch = "wasm32"))]
@@ -1818,10 +1798,12 @@ impl Graph {
         scope: &AudioWorkletGlobalScope,
     ) -> &AudioRenderQuantum {
         let n_workers = self.parallel_workers.max(2);
-        if self.worker_allocs.len() != n_workers {
-            self.worker_allocs = (0..n_workers).map(|_| Alloc::with_capacity(64)).collect();
-            // Allocator identities changed; any cached plan's buffer rebase is
-            // stale. Force a recompute + rebase.
+        if self
+            .partition_plan
+            .as_ref()
+            .is_some_and(|plan| plan.well_formed && plan.assigned_workers != n_workers)
+        {
+            // The worker count changed: the cached worker assignment is stale.
             self.partition_plan = None;
         }
 
@@ -1832,7 +1814,7 @@ impl Graph {
         if self.partition_plan.is_none() {
             let mut plan = self.compute_partition_plan();
             if plan.well_formed {
-                self.assign_workers_and_rebase(&mut plan, n_workers);
+                self.assign_workers(&mut plan, n_workers);
             }
             self.partition_plan = Some(plan);
         }
@@ -1862,7 +1844,7 @@ impl Graph {
             self.pool = Some(WorkerPool::new(n_workers, &scope.event_sender));
         }
         // Clone the Arc so no borrow of `self.pool` is held while we borrow
-        // `self.nodes`/`self.worker_allocs` for the render below.
+        // `self.nodes` for the render below.
         let shared = std::sync::Arc::clone(&self.pool.as_ref().unwrap().shared);
 
         // Publish this quantum's task, then release the parked workers. The raw
@@ -1875,7 +1857,6 @@ impl Graph {
                 nodes: &self.nodes,
                 plan: &plan,
                 boundary: boundary_base,
-                allocs: self.worker_allocs.as_ptr(),
                 frame: scope.current_frame,
                 time: scope.current_time,
                 sample_rate: scope.sample_rate,
@@ -1896,7 +1877,7 @@ impl Graph {
             0,
             &self.nodes,
             &plan,
-            &self.worker_allocs[0],
+            &self.alloc,
             boundary_base,
             &scope0,
             &shared,
@@ -1954,7 +1935,7 @@ impl Graph {
                     i += 1;
                 }
             }
-            // leave self.partition_plan == None -> recompute + rebase next quantum
+            // leave self.partition_plan == None -> recompute next quantum
         } else {
             self.partition_plan = Some(plan);
         }
@@ -2787,7 +2768,7 @@ mod tests {
     // A live graph edit between quanta must invalidate the cached partition plan,
     // and the threaded executor must then render the EDITED topology
     // byte-identically to the serial render of that same edited graph. Guards the
-    // "graph edits mid-render" path: a stale plan or an un-rebased worker buffer
+    // "graph edits mid-render" path: a stale plan or a stale worker assignment
     // would leak the pre-edit graph's output.
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
