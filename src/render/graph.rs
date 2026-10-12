@@ -164,12 +164,19 @@ pub(crate) struct Graph {
     /// serial regardless of worker count.
     parallel_workers: usize,
     /// Persistent pool of render worker threads, spawned once on the first
-    /// threaded render and parked on a barrier between quanta. Rebuilt only when
-    /// the worker count changes; torn down on drop. Spawning threads *per
-    /// quantum* was measured to be a net loss (thread-create + join dwarfs the
-    /// per-quantum DSP), so the threads live across the whole render.
+    /// threaded render and waiting for the next epoch between quanta. Rebuilt
+    /// only when the worker count changes; torn down on drop. Spawning threads
+    /// *per quantum* was measured to be a net loss (thread-create + join dwarfs
+    /// the per-quantum DSP), so the threads live across the whole render.
     #[cfg(not(target_arch = "wasm32"))]
     pool: Option<WorkerPool>,
+    /// Render epoch of the threaded executor, incremented once per quantum.
+    #[cfg(not(target_arch = "wasm32"))]
+    render_epoch: u64,
+    /// Measured partition costs of the last discarded plan, keyed by each
+    /// partition's first node id, to seed the next plan's schedule.
+    #[cfg(not(target_arch = "wasm32"))]
+    partition_cost_memory: std::collections::HashMap<u64, u64>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -243,18 +250,29 @@ struct PartitionPlan {
     /// the merge-node partitions it feeds). Each inner `Vec` lists a partition's
     /// node ids in global topological (`ordered`) order.
     partitions: Vec<Vec<AudioNodeId>>,
-    /// Partition-DAG levels: `layers[l]` lists the indices (into `partitions`) of
-    /// the partitions at depth `l`. Partitions within a layer have no mutual
-    /// dependency and may render concurrently; layers run in order. Used only by
-    /// the threaded executor ([`Graph::render_partitioned_threaded`]).
-    layers: Vec<Vec<usize>>,
-    /// For each partition index, the worker thread it is pinned to (static pin).
-    /// Empty until the threaded executor assigns workers; the serial path
-    /// ignores it.
+    /// Partition-DAG predecessors: `preds[p]` lists the partitions (indices into
+    /// `partitions`, all smaller than `p`) whose cut-edge outputs partition `p`
+    /// sums at its merge nodes. The threaded executor starts `p` once these are
+    /// done in the current quantum.
+    preds: Vec<Vec<usize>>,
+    /// For each partition index, the worker thread it runs on. Empty until the
+    /// threaded executor schedules the plan; the serial path ignores it.
     partition_worker: Vec<usize>,
-    /// Number of workers `partition_worker` was assigned for. `0` means "not yet
-    /// assigned".
+    /// Per worker: the partitions it renders each quantum, in order (see
+    /// [`Graph::schedule_partitions`]).
+    worker_lists: Vec<Vec<usize>>,
+    /// Number of workers the plan was scheduled for. `0` means "not yet
+    /// scheduled".
     assigned_workers: usize,
+    /// Quanta rendered since the last (re)schedule.
+    quanta_since_schedule: usize,
+    /// Per partition: smoothed render cost in nanoseconds, measured by the
+    /// worker that runs it (one writer per quantum) and read by the scheduler
+    /// between quanta. Seeded with an estimate from the node count.
+    cost_ns: Vec<std::sync::atomic::AtomicU64>,
+    /// Per partition: the render epoch in which it last completed. A consumer
+    /// waits for `done[p] == epoch` of each predecessor `p`.
+    done: Vec<std::sync::atomic::AtomicU64>,
     /// Dense, indexed by `AudioNodeId.0`: whether the node is a merge node (its
     /// audio inputs are assembled via `merge_lookup`, never pushed into directly).
     is_merge: Vec<bool>,
@@ -305,6 +323,84 @@ impl UnionFind {
 // Multicore executor (native only)
 // ---------------------------------------------------------------------------
 
+/// Quanta between re-schedules from the measured partition costs.
+#[cfg(not(target_arch = "wasm32"))]
+const RESCHEDULE_QUANTA: usize = 64;
+
+/// Measure partition costs on one quantum in this many (timing every partition
+/// every quantum would add two clock reads per partition).
+#[cfg(not(target_arch = "wasm32"))]
+const COST_SAMPLE_QUANTA: u64 = 8;
+
+/// Critical-path list scheduling of the partition DAG onto `n_workers`.
+///
+/// Repeatedly takes, among the partitions whose predecessors are all scheduled,
+/// the one with the longest remaining path to the end of the DAG (its "bottom
+/// level", in measured cost), and appends it to the worker that becomes free
+/// earliest (worker 0 if `pinned`). Returns the worker of each partition and
+/// each worker's list in execution order.
+///
+/// Deadlock freedom: a partition is appended only after all its predecessors
+/// were appended (to any list), so every wait in a worker's list targets a
+/// partition that appears earlier in this global append order; following the
+/// waits always moves strictly backwards in that order, so no cycle of waits
+/// can form.
+#[cfg(not(target_arch = "wasm32"))]
+fn list_schedule(
+    costs: &[u64],
+    preds: &[Vec<usize>],
+    pinned: &[bool],
+    n_workers: usize,
+) -> (Vec<usize>, Vec<Vec<usize>>) {
+    let n = costs.len();
+    let n_workers = n_workers.max(1);
+    let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut missing = vec![0usize; n];
+    for (q, ps) in preds.iter().enumerate() {
+        missing[q] = ps.len();
+        for &p in ps {
+            succs[p].push(q);
+        }
+    }
+    // Predecessors always have smaller indices, so a reverse sweep sees every
+    // successor's bottom level first.
+    let mut bottom = vec![0u64; n];
+    for p in (0..n).rev() {
+        bottom[p] = costs[p] + succs[p].iter().map(|&s| bottom[s]).max().unwrap_or(0);
+    }
+
+    // Ties broken by the lower partition index, so the schedule is deterministic.
+    let mut ready: std::collections::BinaryHeap<(u64, std::cmp::Reverse<usize>)> = (0..n)
+        .filter(|&q| missing[q] == 0)
+        .map(|q| (bottom[q], std::cmp::Reverse(q)))
+        .collect();
+    let mut ready_at = vec![0u64; n];
+    let mut free_at = vec![0u64; n_workers];
+    let mut partition_worker = vec![0usize; n];
+    let mut worker_lists: Vec<Vec<usize>> = vec![Vec::new(); n_workers];
+
+    while let Some((_, std::cmp::Reverse(q))) = ready.pop() {
+        let w = if pinned[q] {
+            0
+        } else {
+            (0..n_workers).min_by_key(|&i| free_at[i]).unwrap()
+        };
+        let finish = free_at[w].max(ready_at[q]) + costs[q];
+        free_at[w] = finish;
+        partition_worker[q] = w;
+        worker_lists[w].push(q);
+        for &s in &succs[q] {
+            ready_at[s] = ready_at[s].max(finish);
+            missing[s] -= 1;
+            if missing[s] == 0 {
+                ready.push((bottom[s], std::cmp::Reverse(s)));
+            }
+        }
+    }
+
+    (partition_worker, worker_lists)
+}
+
 /// Per-quantum render task, published by the main thread into [`PoolShared`]
 /// before releasing the workers. All fields are plain `Copy` data (raw pointers
 /// and scalars); they point at render state that lives for the whole quantum:
@@ -319,6 +415,10 @@ struct PoolTask {
     frame: u64,
     time: f64,
     sample_rate: f32,
+    /// This quantum's render epoch (see [`PoolShared::epoch`]).
+    epoch: u64,
+    /// Whether to time the partitions this quantum (cost sampling).
+    measure: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -330,6 +430,8 @@ impl PoolTask {
         frame: 0,
         time: 0.0,
         sample_rate: 0.0,
+        epoch: 0,
+        measure: false,
     };
 }
 
@@ -337,16 +439,20 @@ impl PoolTask {
 ///
 /// # Safety (why the `unsafe impl Send + Sync` below are sound)
 ///
-/// The raw pointers in `task` and the `!Send` buffer state they reach are only
-/// ever touched inside the fork/join window delimited by the barriers:
+/// The raw pointers in `task` and the `!Send` render state they reach are only
+/// touched between the start and the end of an epoch (one quantum):
 ///
-/// * `start` (released by the main thread once per quantum, after it has
-///   published `task`) wakes the workers. The barrier's happens-before makes the
-///   freshly-published `task` visible to every worker.
-/// * `layer` is waited on once per DAG level by *all* parties, ordering a
-///   producer's boundary write (earlier level) before a merge's read (later
-///   level), and — on its final wait — the workers' `slots` writes before the
-///   main thread reads them.
+/// * Start: the main thread writes `task`, then stores the new `epoch` with
+///   Release. A worker reads `task` only after loading that epoch with Acquire,
+///   so it sees the complete task.
+/// * Dependencies: a partition's last action is storing the epoch into its
+///   `done` mark (Release). A partition reads its producers' boundary slots only
+///   after loading each producer's `done == epoch` (Acquire), so it sees the
+///   complete boundary writes. Producers always come earlier in the global
+///   schedule order (see [`list_schedule`]), so these waits cannot deadlock.
+/// * End: a worker writes its `slots[w]`, then increments `finished` (Release);
+///   the main thread loads `finished == n_workers - 1` (Acquire) before reading
+///   any slot or touching the graph again.
 /// * Disjointness: every node is touched by exactly one worker per quantum;
 ///   `AudioParam`/listener nodes are union-ed into the partition they feed, and
 ///   the two halves of a cycle-broken DelayNode (which share processor state
@@ -362,15 +468,17 @@ impl PoolTask {
 ///   splits them across workers.
 #[cfg(not(target_arch = "wasm32"))]
 struct PoolShared {
-    /// Quantum-start rendezvous: `n_workers` parties (main + spawned workers).
-    start: std::sync::Barrier,
-    /// Inter-level rendezvous, reused once per DAG level: `n_workers` parties.
-    layer: std::sync::Barrier,
-    /// Set on teardown; checked by each worker right after `start`.
+    /// The current render epoch; the main thread bumps it once per quantum to
+    /// start the workers. Workers spin, then park, while it is unchanged.
+    epoch: std::sync::atomic::AtomicU64,
+    /// Spawned workers that finished the current epoch.
+    finished: std::sync::atomic::AtomicUsize,
+    /// Set on teardown; checked by each worker while waiting for an epoch.
     shutdown: std::sync::atomic::AtomicBool,
-    /// The current quantum's task, published before `start`.
+    /// The current quantum's task, published before the epoch is bumped.
     task: std::cell::UnsafeCell<PoolTask>,
-    /// Per-worker end-of-life node lists, filled before the final `layer` wait.
+    /// Per spawned worker (index `w - 1`): end-of-life node lists, filled before
+    /// incrementing `finished`.
     slots: Vec<std::cell::UnsafeCell<Vec<AudioNodeId>>>,
 }
 
@@ -381,7 +489,7 @@ unsafe impl Send for PoolShared {}
 #[cfg(not(target_arch = "wasm32"))]
 unsafe impl Sync for PoolShared {}
 
-/// A persistent set of render worker threads, parked on `shared.start` between
+/// A persistent set of render worker threads, waiting for the next epoch between
 /// quanta. Dropping the pool signals shutdown and joins every thread.
 #[cfg(not(target_arch = "wasm32"))]
 struct WorkerPool {
@@ -393,12 +501,14 @@ struct WorkerPool {
 #[cfg(not(target_arch = "wasm32"))]
 impl Drop for WorkerPool {
     fn drop(&mut self) {
-        // Workers are parked at `start` between quanta (drop never races a
-        // render). Flag shutdown, release them once, and join.
+        // Workers wait for an epoch between quanta (drop never races a render).
+        // Flag shutdown, wake them, and join.
         self.shared
             .shutdown
             .store(true, std::sync::atomic::Ordering::Release);
-        self.shared.start.wait();
+        for h in &self.handles {
+            h.thread().unpark();
+        }
         for h in self.handles.drain(..) {
             let _ = h.join();
         }
@@ -413,11 +523,11 @@ impl WorkerPool {
         event_sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
     ) -> Self {
         let shared = std::sync::Arc::new(PoolShared {
-            start: std::sync::Barrier::new(n_workers),
-            layer: std::sync::Barrier::new(n_workers),
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            finished: std::sync::atomic::AtomicUsize::new(0),
             shutdown: std::sync::atomic::AtomicBool::new(false),
             task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
-            slots: (0..n_workers)
+            slots: (1..n_workers)
                 .map(|_| std::cell::UnsafeCell::new(Vec::new()))
                 .collect(),
         });
@@ -614,8 +724,62 @@ mod rt_priority_tests {
     }
 }
 
-/// Entry point of a spawned render worker. Parks on `start` between quanta,
-/// then renders its pinned partitions for the published task until shutdown.
+/// How long an idle worker spins for the next epoch before parking. Quanta of
+/// an offline render, and the quanta within one audio callback, follow each
+/// other closely, so a worker usually picks up the next epoch while spinning
+/// and the OS wake-up of a park (tens of microseconds) is avoided; between
+/// audio callbacks the workers park instead of burning a core.
+#[cfg(not(target_arch = "wasm32"))]
+const IDLE_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
+
+/// Spins on a dependency or completion condition before falling back to
+/// yielding the core.
+#[cfg(not(target_arch = "wasm32"))]
+const DEPENDENCY_SPINS: u32 = 1 << 14;
+
+/// Wait until `ready()` holds: spin first (dependencies usually resolve within
+/// microseconds), then yield the core while waiting.
+#[cfg(not(target_arch = "wasm32"))]
+fn spin_then_yield(mut ready: impl FnMut() -> bool) {
+    for _ in 0..DEPENDENCY_SPINS {
+        if ready() {
+            return;
+        }
+        std::hint::spin_loop();
+    }
+    while !ready() {
+        std::thread::yield_now();
+    }
+}
+
+/// Wait for an epoch other than `seen`, or `None` on shutdown. Spins for
+/// [`IDLE_SPIN`], then parks; the main thread unparks every worker after
+/// storing a new epoch, and a park after that unpark returns at once.
+#[cfg(not(target_arch = "wasm32"))]
+fn wait_for_epoch(shared: &PoolShared, seen: u64) -> Option<u64> {
+    use std::sync::atomic::Ordering;
+    let start = std::time::Instant::now();
+    let mut spins = 0u32;
+    loop {
+        if shared.shutdown.load(Ordering::Acquire) {
+            return None;
+        }
+        let epoch = shared.epoch.load(Ordering::Acquire);
+        if epoch != seen {
+            return Some(epoch);
+        }
+        spins = spins.wrapping_add(1);
+        if spins % 64 != 0 || start.elapsed() < IDLE_SPIN {
+            std::hint::spin_loop();
+        } else {
+            std::thread::park();
+        }
+    }
+}
+
+/// Entry point of a spawned render worker. Waits for each epoch, renders its
+/// scheduled partitions for the published task, and signals completion, until
+/// shutdown.
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_thread_main(
     w: usize,
@@ -623,8 +787,8 @@ fn worker_thread_main(
     sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
 ) {
     // Promote to a realtime scheduling class before entering the render loop so
-    // the RT audio callback (worker 0) never blocks on the barrier behind a
-    // normal-priority worker. Best-effort; a failure only costs glitch margin.
+    // the RT audio callback (worker 0) never waits on a normal-priority worker.
+    // Best-effort; a failure only costs glitch margin.
     let priority = promote_current_thread_to_audio();
     if priority != AudioThreadPriority::Promoted {
         log::debug!("render worker {w}: realtime priority not acquired ({priority:?})");
@@ -632,72 +796,92 @@ fn worker_thread_main(
     // Fill this worker's buffer pool before the first quantum.
     Alloc::prewarm(64);
 
-    loop {
-        shared.start.wait();
-        if shared.shutdown.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+    let mut seen = 0;
+    while let Some(epoch) = wait_for_epoch(shared, seen) {
+        seen = epoch;
+        // Processor panics are caught per node; anything that unwinds out here
+        // is an executor bug. The other threads would then wait forever for
+        // this worker, so fail fast instead of hanging the render.
+        let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
+            // SAFETY: written before the epoch store we observed (see PoolShared).
+            let task = unsafe { *shared.task.get() };
+            // SAFETY: the pointed-at state lives for the whole quantum (see
+            // PoolTask); this worker only reaches its own partitions' nodes.
+            let nodes: &NodeCollection = unsafe { &*task.nodes };
+            let plan: &PartitionPlan = unsafe { &*task.plan };
+            let scope = AudioWorkletGlobalScope {
+                current_frame: task.frame,
+                current_time: task.time,
+                sample_rate: task.sample_rate,
+                node_id: std::cell::Cell::new(AudioNodeId(0)),
+                event_sender: sender.clone(),
+            };
+            let freeable = run_worker_list(
+                w,
+                nodes,
+                plan,
+                task.boundary,
+                &scope,
+                task.epoch,
+                task.measure,
+            );
+            // SAFETY: only worker `w` writes `slots[w - 1]`; the main thread
+            // reads it after the `finished` increment below.
+            unsafe {
+                *shared.slots[w - 1].get() = freeable;
+            }
+        }));
+        if outcome.is_err() {
+            log::error!("render worker {w} panicked outside a node; aborting");
+            std::process::abort();
         }
-        // SAFETY: published by the main thread before it released `start`; the
-        // barrier's happens-before makes the write visible here.
-        let task = unsafe { *shared.task.get() };
-        // SAFETY: the pointed-at state lives for the whole quantum (see PoolTask
-        // doc); this worker only reaches nodes/buffers in its own partitions.
-        let nodes: &NodeCollection = unsafe { &*task.nodes };
-        let plan: &PartitionPlan = unsafe { &*task.plan };
-        let alloc = &Alloc;
-
-        let scope = AudioWorkletGlobalScope {
-            current_frame: task.frame,
-            current_time: task.time,
-            sample_rate: task.sample_rate,
-            node_id: std::cell::Cell::new(AudioNodeId(0)),
-            event_sender: sender.clone(),
-        };
-
-        run_partitions_one_quantum(w, nodes, plan, alloc, task.boundary, &scope, shared);
+        shared
+            .finished
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 }
 
-/// Render worker `w`'s pinned partitions for one quantum, one DAG level at a
-/// time, synchronizing on `shared.layer` between levels. The caller (main
-/// thread, `w == 0`) and every spawned worker run this in lock-step so the
-/// per-level barriers line up. End-of-life node ids are published into
-/// `shared.slots[w]` just before the final level barrier, so the main thread may
-/// read every slot once that barrier releases.
+/// Render worker `w`'s scheduled partitions for one quantum, in its list order.
+/// Each partition first waits until all its producers published `done` for this
+/// epoch, then runs its nodes in serial order and publishes its own `done`.
+/// Returns the end-of-life node ids it recorded.
 #[cfg(not(target_arch = "wasm32"))]
-fn run_partitions_one_quantum(
+fn run_worker_list(
     w: usize,
     nodes: &NodeCollection,
     plan: &PartitionPlan,
-    alloc: &Alloc,
     boundary: *mut Option<BoundarySignal>,
     scope: &AudioWorkletGlobalScope,
-    shared: &PoolShared,
-) {
+    epoch: u64,
+    measure: bool,
+) -> Vec<AudioNodeId> {
+    use std::sync::atomic::Ordering;
+    let alloc = &Alloc;
     let mut freeable: Vec<AudioNodeId> = Vec::new();
-    let last = plan.layers.len().saturating_sub(1);
 
-    for (level, layer) in plan.layers.iter().enumerate() {
-        for &pidx in layer {
-            if plan.partition_worker[pidx] != w {
-                continue;
-            }
-            for &index in &plan.partitions[pidx] {
-                process_node_threaded(nodes, plan, alloc, boundary, scope, index, &mut freeable);
-            }
+    for &pidx in &plan.worker_lists[w] {
+        for &producer in &plan.preds[pidx] {
+            let done = &plan.done[producer];
+            spin_then_yield(|| done.load(Ordering::Acquire) == epoch);
         }
-        if level == last {
-            // Publish before the final barrier so the post-barrier reader (main
-            // thread) observes a complete list.
-            // SAFETY: only worker `w` writes `slots[w]`; the final `layer` wait
-            // orders this write before the main thread's read.
-            unsafe {
-                *shared.slots[w].get() = std::mem::take(&mut freeable);
-            }
+
+        let started = measure.then(std::time::Instant::now);
+        for &index in &plan.partitions[pidx] {
+            process_node_threaded(nodes, plan, alloc, boundary, scope, index, &mut freeable);
         }
-        // Publish this level's boundary writes before the next level reads them.
-        shared.layer.wait();
+        if let Some(started) = started {
+            // Exponential moving average (1/4 weight); this worker is the only
+            // writer of this partition's cost in this epoch.
+            let sample = started.elapsed().as_nanos() as u64;
+            let cost = &plan.cost_ns[pidx];
+            let old = cost.load(Ordering::Relaxed);
+            cost.store(old - old / 4 + sample / 4, Ordering::Relaxed);
+        }
+
+        plan.done[pidx].store(epoch, Ordering::Release);
     }
+
+    freeable
 }
 
 /// Process a single node on a worker thread. Mirrors the per-node body of
@@ -727,8 +911,9 @@ fn process_node_threaded(
             node.has_inputs_connected = true;
             for slot in &merge.slots {
                 for &bidx in &slot.sources {
-                    // SAFETY: filled by the producer in an earlier level (barrier
-                    // ordered); this index is read-only here.
+                    // SAFETY: filled by the producing partition, whose `done` for
+                    // this epoch was observed (Acquire) before this partition
+                    // started; this index is read-only here.
                     let signal = unsafe { (*boundary.add(bidx)).as_ref() }
                         .expect("boundary buffer filled before merge");
                     let quantum = alloc.boundary_to_quantum(signal);
@@ -757,7 +942,7 @@ fn process_node_threaded(
     for &(output_index, bidx) in &plan.copy_out[node_idx] {
         let signal = node.outputs[output_index].to_boundary();
         // SAFETY: this worker is the sole producer for `bidx` (one cut edge ->
-        // one slot); no other thread writes or reads it in this level.
+        // one slot); its consumer reads it only after this partition's `done`.
         unsafe {
             *boundary.add(bidx) = Some(signal);
         }
@@ -828,6 +1013,10 @@ impl Graph {
             parallel_workers,
             #[cfg(not(target_arch = "wasm32"))]
             pool: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            render_epoch: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            partition_cost_memory: std::collections::HashMap::new(),
         }
     }
 
@@ -956,7 +1145,7 @@ impl Graph {
             });
 
         self.ordered.clear(); // void current ordering
-        self.partition_plan = None; // topology changed, recompute partitions
+        self.forget_partition_plan(); // topology changed, recompute partitions
     }
 
     pub fn remove_edge(&mut self, source: (AudioNodeId, usize), dest: (AudioNodeId, usize)) {
@@ -975,7 +1164,7 @@ impl Graph {
         // The partition plan, unlike `ordered`, encodes the exact edge set (which edges
         // are cut, their boundary slots, merge fold order), so *any* edge removal
         // invalidates it even when the topological order is still valid.
-        self.partition_plan = None;
+        self.forget_partition_plan();
     }
 
     pub fn mark_control_handle_dropped(&mut self, index: AudioNodeId) {
@@ -1446,18 +1635,14 @@ impl Graph {
             }
         }
 
-        // 5. Topologically order the partitions (Kahn), tracking the DAG *level*
-        //    (longest-path depth) of each group so the threaded executor can run
-        //    one level at a time. Any valid topo order is correct for
-        //    byte-identity; it only needs producers before merges.
+        // 5. Topologically order the partitions (Kahn). Any valid topo order is
+        //    correct for byte-identity; it only needs producers before merges.
         let mut queue: std::collections::VecDeque<usize> =
             (0..n_groups).filter(|&g| dag_indeg[g] == 0).collect();
         let mut order: Vec<usize> = Vec::with_capacity(n_groups);
-        let mut level_of_group = vec![0usize; n_groups];
         while let Some(g) = queue.pop_front() {
             order.push(g);
             for &h in &dag_adj[g] {
-                level_of_group[h] = level_of_group[h].max(level_of_group[g] + 1);
                 dag_indeg[h] -= 1;
                 if dag_indeg[h] == 0 {
                     queue.push_back(h);
@@ -1466,10 +1651,10 @@ impl Graph {
         }
         let well_formed = order.len() == n_groups;
 
-        // Reorder partitions into execution order (if well-formed) and build the
-        // execution-index -> level map, then the layer buckets.
+        // Reorder partitions into execution order (if well-formed) and translate
+        // the DAG edges into per-partition predecessor lists in execution indices.
         let mut ordered_partitions: Vec<Vec<AudioNodeId>> = Vec::new();
-        let mut layers: Vec<Vec<usize>> = Vec::new();
+        let mut preds: Vec<Vec<usize>> = Vec::new();
         if well_formed {
             // group index -> execution index
             let mut exec_of_group = vec![usize::MAX; n_groups];
@@ -1477,18 +1662,33 @@ impl Graph {
                 exec_of_group[g] = exec_idx;
                 ordered_partitions.push(std::mem::take(&mut partitions[g]));
             }
-            let max_level = level_of_group.iter().copied().max().unwrap_or(0);
-            layers = vec![Vec::new(); max_level + 1];
-            for g in 0..n_groups {
-                layers[level_of_group[g]].push(exec_of_group[g]);
+            preds = vec![Vec::new(); n_groups];
+            for (g, targets) in dag_adj.iter().enumerate() {
+                for &h in targets {
+                    preds[exec_of_group[h]].push(exec_of_group[g]);
+                }
             }
         }
 
+        // Seed costs with a node-count estimate until the executor measures them.
+        let cost_ns = ordered_partitions
+            .iter()
+            .map(|p| std::sync::atomic::AtomicU64::new(1_000 * p.len() as u64))
+            .collect();
+        let done = ordered_partitions
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
+
         PartitionPlan {
             partitions: ordered_partitions,
-            layers,
+            preds,
             partition_worker: Vec::new(),
+            worker_lists: Vec::new(),
             assigned_workers: 0,
+            quanta_since_schedule: 0,
+            cost_ns,
+            done,
             is_merge,
             copy_out,
             merge_lookup,
@@ -1738,47 +1938,47 @@ impl Graph {
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
     }
 
-    /// Assign each partition to a worker thread (static pin). A node only runs on
-    /// its partition's pinned worker. Render buffers need no re-homing: buffer
-    /// pools are thread local, so a buffer that moves with a re-pinned node
-    /// simply joins its new worker's pool (see the `PoolShared` safety notes).
-    /// Called once whenever the plan is (re)computed.
+    /// (Re)compute which worker renders each partition, and in which order, from
+    /// the measured partition costs (see [`list_schedule`]). Called when the plan
+    /// is (re)computed, when the worker count changes, and every
+    /// [`RESCHEDULE_QUANTA`] quanta so the schedule follows the measured costs.
+    /// Only *where and when* a partition runs changes, never the per-node order or
+    /// the merge fold order, so the output is byte-identical whatever the schedule.
+    /// Render buffers need no re-homing: buffer pools are thread local, so a
+    /// buffer that moves with a re-scheduled node simply joins its new worker's
+    /// pool (see the `PoolShared` safety notes).
     #[cfg(not(target_arch = "wasm32"))]
-    fn assign_workers(&self, plan: &mut PartitionPlan, n_workers: usize) {
-        let n_parts = plan.partitions.len();
-        let mut partition_worker = vec![0usize; n_parts];
-        // Round-robin partitions to workers *within each layer*, so each layer's
-        // independent partitions spread across cores for balance.
-        for layer in &plan.layers {
-            for (i, &pidx) in layer.iter().enumerate() {
-                partition_worker[pidx] = i % n_workers;
-            }
-        }
+    fn schedule_partitions(&self, plan: &mut PartitionPlan, n_workers: usize) {
+        // Thread affinity: any partition containing a node that demands a stable
+        // calling thread (`ThreadAffinity::RenderThread`, e.g. some CLAP plugins)
+        // is pinned to worker 0 - the render origin thread, whose OS identity is
+        // invariant across re-plans, re-schedules and pool resizes.
+        let pinned: Vec<bool> = plan
+            .partitions
+            .iter()
+            .map(|part| {
+                part.iter().any(|&id| {
+                    self.nodes
+                        .get_unchecked(id)
+                        .borrow()
+                        .processor
+                        .thread_affinity()
+                        == ThreadAffinity::RenderThread
+                })
+            })
+            .collect();
+        let costs: Vec<u64> = plan
+            .cost_ns
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .collect();
 
-        // Thread-affinity override: any partition containing a node that demands
-        // a stable calling thread (`ThreadAffinity::RenderThread`, e.g. some CLAP
-        // plugins) is pinned to worker 0 — the render origin thread, whose OS
-        // identity is invariant across partition replans and pool resizes. This
-        // keeps such a node on one thread for its whole lifetime even as the
-        // graph is edited, at the cost of folding its partition back onto the
-        // serial-equivalent thread. Output stays byte-identical (worker pinning
-        // never affects the fold order).
-        for (pidx, part) in plan.partitions.iter().enumerate() {
-            let pins_to_origin = part.iter().any(|&id| {
-                self.nodes
-                    .get_unchecked(id)
-                    .borrow()
-                    .processor
-                    .thread_affinity()
-                    == ThreadAffinity::RenderThread
-            });
-            if pins_to_origin {
-                partition_worker[pidx] = 0;
-            }
-        }
-
+        let (partition_worker, worker_lists) =
+            list_schedule(&costs, &plan.preds, &pinned, n_workers);
         plan.partition_worker = partition_worker;
+        plan.worker_lists = worker_lists;
         plan.assigned_workers = n_workers;
+        plan.quanta_since_schedule = 0;
     }
 
     /// Render a single audio quantum across `parallel_workers` threads, producing
@@ -1798,38 +1998,37 @@ impl Graph {
         scope: &AudioWorkletGlobalScope,
     ) -> &AudioRenderQuantum {
         let n_workers = self.parallel_workers.max(2);
-        if self
-            .partition_plan
-            .as_ref()
-            .is_some_and(|plan| plan.well_formed && plan.assigned_workers != n_workers)
-        {
-            // The worker count changed: the cached worker assignment is stale.
-            self.partition_plan = None;
-        }
 
         if self.ordered.is_empty() {
             self.order_nodes();
-            self.partition_plan = None;
+            self.forget_partition_plan();
         }
         if self.partition_plan.is_none() {
             let mut plan = self.compute_partition_plan();
             if plan.well_formed {
-                self.assign_workers(&mut plan, n_workers);
+                self.seed_partition_costs(&plan);
+                self.schedule_partitions(&mut plan, n_workers);
             }
             self.partition_plan = Some(plan);
         }
 
         // Take the plan out so we can borrow `self.nodes` during the pass.
-        let plan = self.partition_plan.take().unwrap();
+        let mut plan = self.partition_plan.take().unwrap();
 
         if !plan.well_formed {
             self.partition_plan = Some(plan);
             return self.render(scope);
         }
 
+        // Follow the measured costs (and any change of the worker count).
+        if plan.assigned_workers != n_workers || plan.quanta_since_schedule >= RESCHEDULE_QUANTA {
+            self.schedule_partitions(&mut plan, n_workers);
+        }
+        plan.quanta_since_schedule += 1;
+
         // Per-quantum boundary buffers (deep-copied cut-edge signals). Accessed
-        // from worker threads by raw pointer at disjoint indices; the per-level
-        // barrier orders a producer's write before a merge's read.
+        // from worker threads by raw pointer at disjoint indices; a merge reads a
+        // slot only after the producing partition published `done` for this epoch.
         let mut boundary: Vec<Option<BoundarySignal>> =
             (0..plan.boundary_count).map(|_| None).collect();
         let boundary_base = boundary.as_mut_ptr();
@@ -1837,21 +2036,22 @@ impl Graph {
         // Ensure the persistent worker pool matches the current worker count.
         // Spawning per quantum was measured to be a net loss (thread create/join
         // dwarfs the per-quantum DSP), so the threads live across the render and
-        // park on `shared.start` between quanta.
+        // wait for the next epoch between quanta.
         if self.pool.as_ref().is_none_or(|p| p.n_workers != n_workers) {
             // Drop any stale pool first (joins its threads) before spawning anew.
             self.pool = None;
             self.pool = Some(WorkerPool::new(n_workers, &scope.event_sender));
         }
-        // Clone the Arc so no borrow of `self.pool` is held while we borrow
-        // `self.nodes` for the render below.
-        let shared = std::sync::Arc::clone(&self.pool.as_ref().unwrap().shared);
+        self.render_epoch += 1;
+        let epoch = self.render_epoch;
+        let measure = epoch % COST_SAMPLE_QUANTA == 1;
+        let pool = self.pool.as_ref().unwrap();
+        let shared = &*pool.shared;
 
-        // Publish this quantum's task, then release the parked workers. The raw
-        // pointers reach render state that lives for the whole quantum; the
-        // `start` barrier's happens-before makes the task visible to workers.
-        // SAFETY: workers are parked at `start`; nothing reads `task` until the
-        // `start.wait()` below releases them.
+        // Publish this quantum's task, then start the epoch and wake the workers.
+        // SAFETY: every worker finished the previous epoch (the `finished` wait
+        // below) and reads `task` only after observing the new epoch, which is
+        // stored with Release after this write.
         unsafe {
             *shared.task.get() = PoolTask {
                 nodes: &self.nodes,
@@ -1860,12 +2060,21 @@ impl Graph {
                 frame: scope.current_frame,
                 time: scope.current_time,
                 sample_rate: scope.sample_rate,
+                epoch,
+                measure,
             };
         }
-        shared.start.wait();
+        shared
+            .finished
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        shared
+            .epoch
+            .store(epoch, std::sync::atomic::Ordering::Release);
+        for handle in &pool.handles {
+            handle.thread().unpark();
+        }
 
-        // The calling thread acts as worker 0, running in lock-step with the
-        // spawned workers on the per-level barrier.
+        // The calling thread acts as worker 0.
         let scope0 = AudioWorkletGlobalScope {
             current_frame: scope.current_frame,
             current_time: scope.current_time,
@@ -1873,28 +2082,41 @@ impl Graph {
             node_id: std::cell::Cell::new(AudioNodeId(0)),
             event_sender: scope.event_sender.clone(),
         };
-        run_partitions_one_quantum(
-            0,
-            &self.nodes,
-            &plan,
-            &self.alloc,
-            boundary_base,
-            &scope0,
-            &shared,
-        );
+        // As on the spawned workers: a panic escaping here would leave them
+        // waiting for partitions that never complete, so fail fast.
+        let own_freeable = match panic::catch_unwind(AssertUnwindSafe(|| {
+            run_worker_list(
+                0,
+                &self.nodes,
+                &plan,
+                boundary_base,
+                &scope0,
+                epoch,
+                measure,
+            )
+        })) {
+            Ok(freeable) => freeable,
+            Err(_) => {
+                log::error!("render worker 0 panicked outside a node; aborting");
+                std::process::abort();
+            }
+        };
 
-        // The final `layer` barrier has released: every worker has processed its
-        // partitions and published its free-list. Collect them.
-        let freeables: Vec<Vec<AudioNodeId>> = shared
+        // Wait for the spawned workers; each published its free-list before
+        // incrementing `finished` (Release), so the Acquire load orders both
+        // their slot writes and all their node/boundary accesses before ours.
+        let spawned = n_workers - 1;
+        spin_then_yield(|| shared.finished.load(std::sync::atomic::Ordering::Acquire) == spawned);
+        let mut freeables: Vec<Vec<AudioNodeId>> = shared
             .slots
             .iter()
             .map(|s| {
-                // SAFETY: barrier-ordered; workers are now parked at `start` and
-                // no longer touch their slots.
+                // SAFETY: ordered by the `finished` Acquire above; workers no
+                // longer touch their slots until the next epoch.
                 unsafe { std::mem::take(&mut *s.get()) }
             })
             .collect();
-        drop(shared);
+        freeables.push(own_freeable);
 
         // Drop boundary buffers now (on this thread) before any node mutation.
         drop(boundary);
@@ -1935,13 +2157,53 @@ impl Graph {
                     i += 1;
                 }
             }
-            // leave self.partition_plan == None -> recompute next quantum
+            // leave self.partition_plan == None -> recompute next quantum, seeded
+            // with this plan's measured costs
+            self.remember_partition_costs(&plan);
         } else {
             self.partition_plan = Some(plan);
         }
 
         // Return the output buffer of destination node
         &self.nodes.get_unchecked_mut(AudioNodeId(0)).outputs[0]
+    }
+
+    /// Drop the cached partition plan, keeping its measured partition costs to
+    /// seed the next plan.
+    fn forget_partition_plan(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(plan) = self.partition_plan.take() {
+            self.remember_partition_costs(&plan);
+        }
+        self.partition_plan = None;
+    }
+
+    /// Save a plan's measured partition costs, keyed by each partition's first
+    /// node id. Re-plans happen whenever a node is freed (e.g. every finished
+    /// voice), and most partitions survive them unchanged; without this every
+    /// re-plan would fall back to the node-count estimate.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn remember_partition_costs(&mut self, plan: &PartitionPlan) {
+        self.partition_cost_memory.clear();
+        for (part, cost) in plan.partitions.iter().zip(&plan.cost_ns) {
+            if let Some(first) = part.first() {
+                self.partition_cost_memory
+                    .insert(first.0, cost.load(std::sync::atomic::Ordering::Relaxed));
+            }
+        }
+    }
+
+    /// Seed a fresh plan's costs from the previous plan's measurements.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn seed_partition_costs(&self, plan: &PartitionPlan) {
+        for (part, cost) in plan.partitions.iter().zip(&plan.cost_ns) {
+            if let Some(known) = part
+                .first()
+                .and_then(|first| self.partition_cost_memory.get(&first.0))
+            {
+                cost.store(*known, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
     }
 
     pub fn before_drop(&mut self, scope: &AudioWorkletGlobalScope) {
@@ -3225,5 +3487,79 @@ mod tests {
             threads.iter().all(|&(_, t)| t == threads[0].1),
             "delay writer and reader must stay on one thread: {threads:?}"
         );
+    }
+
+    // The executor runs each worker's list in order and waits for producers by
+    // their `done` marks, so the schedule itself must guarantee: every partition
+    // exactly once, pinned partitions on worker 0, and no possible deadlock.
+    // Checked on random DAGs by executing the lists with those waits.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_list_schedule_complete_pinned_and_deadlock_free() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rand = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+
+        for case in 0..200 {
+            let n = 1 + rand(60) as usize;
+            // predecessors always have smaller indices (execution order)
+            let preds: Vec<Vec<usize>> = (0..n)
+                .map(|q| {
+                    let mut ps: Vec<usize> = (0..rand(4))
+                        .filter(|_| q > 0)
+                        .map(|_| rand(q as u64) as usize)
+                        .collect();
+                    ps.sort_unstable();
+                    ps.dedup();
+                    ps
+                })
+                .collect();
+            let costs: Vec<u64> = (0..n).map(|_| 1 + rand(10_000)).collect();
+            let pinned: Vec<bool> = (0..n).map(|_| rand(10) == 0).collect();
+            let workers = 1 + rand(8) as usize;
+
+            let (partition_worker, lists) = list_schedule(&costs, &preds, &pinned, workers);
+
+            assert_eq!(lists.len(), workers, "case {case}");
+            let mut seen = vec![false; n];
+            for (w, list) in lists.iter().enumerate() {
+                for &q in list {
+                    assert!(!seen[q], "case {case}: partition {q} scheduled twice");
+                    seen[q] = true;
+                    assert_eq!(partition_worker[q], w, "case {case}");
+                    if pinned[q] {
+                        assert_eq!(w, 0, "case {case}: pinned partition {q} off worker 0");
+                    }
+                }
+            }
+            assert!(
+                seen.iter().all(|&s| s),
+                "case {case}: partition not scheduled"
+            );
+
+            // Execute the lists: each worker may only run its next partition once
+            // all its producers are done. Must finish without getting stuck.
+            let mut done = vec![false; n];
+            let mut next = vec![0usize; workers];
+            let mut remaining = n;
+            while remaining > 0 {
+                let mut progressed = false;
+                for w in 0..workers {
+                    if let Some(&q) = lists[w].get(next[w]) {
+                        if preds[q].iter().all(|&p| done[p]) {
+                            done[q] = true;
+                            next[w] += 1;
+                            remaining -= 1;
+                            progressed = true;
+                        }
+                    }
+                }
+                assert!(progressed, "case {case}: schedule deadlocks");
+            }
+        }
     }
 }
