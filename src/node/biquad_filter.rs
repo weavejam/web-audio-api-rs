@@ -1182,8 +1182,16 @@ mod stereo {
                 scalar(&coefs, &il, &mut el, &mut rl);
                 scalar(&coefs, &ir, &mut er, &mut rr);
                 for i in 0..RENDER_QUANTUM_SIZE {
-                    assert_eq!(ol[i].to_bits(), el[i].to_bits(), "L block {block} frame {i}");
-                    assert_eq!(or[i].to_bits(), er[i].to_bits(), "R block {block} frame {i}");
+                    assert_eq!(
+                        ol[i].to_bits(),
+                        el[i].to_bits(),
+                        "L block {block} frame {i}"
+                    );
+                    assert_eq!(
+                        or[i].to_bits(),
+                        er[i].to_bits(),
+                        "R block {block} frame {i}"
+                    );
                 }
                 for k in 0..4 {
                     assert_eq!(sl[k].to_bits(), rl[k].to_bits());
