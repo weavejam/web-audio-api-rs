@@ -649,35 +649,55 @@ impl AudioRenderQuantum {
     /// Both are captured by de-duplicating on the backing buffer pointer: silent
     /// channels share the static zero block, and up-mixed channels share
     /// their source pointer.
+    ///
+    /// Written in place into a slot that persists across quanta: the sample
+    /// blocks of the previous quantum's signal are reused, so the steady state
+    /// allocates nothing on the render threads (a fresh `Box` per channel per
+    /// cut edge per quantum used to hit the global allocator from every worker).
+    /// `epoch` stamps the quantum the signal belongs to.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn to_boundary(&self) -> BoundarySignal {
-        let mut channel_groups: ArrayVec<u8, MAX_CHANNELS> = ArrayVec::new();
-        let mut groups: ArrayVec<BoundaryGroup, MAX_CHANNELS> = ArrayVec::new();
+    pub(crate) fn write_boundary(&self, slot: &mut Option<BoundarySignal>, epoch: u64) {
+        let signal = slot.get_or_insert_with(|| BoundarySignal {
+            single_valued: false,
+            channel_groups: ArrayVec::new(),
+            groups: ArrayVec::new(),
+            spare: ArrayVec::new(),
+            epoch: 0,
+        });
+        // recycle last quantum's sample blocks
+        for group in std::mem::take(&mut signal.groups) {
+            if let BoundaryGroup::Samples(data) = group {
+                if signal.spare.len() < MAX_CHANNELS {
+                    signal.spare.push(data);
+                }
+            }
+        }
+        signal.channel_groups.clear();
         let mut group_ptrs: ArrayVec<*const f32, MAX_CHANNELS> = ArrayVec::new();
 
         for ch in &self.channels {
             let ptr = ch.data_ptr();
             if let Some(gi) = group_ptrs.iter().position(|&p| p == ptr) {
-                channel_groups.push(gi as u8);
+                signal.channel_groups.push(gi as u8);
             } else {
-                let gi = groups.len() as u8;
+                let gi = signal.groups.len() as u8;
                 group_ptrs.push(ptr);
                 if ch.is_silent() {
-                    groups.push(BoundaryGroup::Silent);
+                    signal.groups.push(BoundaryGroup::Silent);
                 } else {
-                    let mut data = Box::new([0.0f32; RENDER_QUANTUM_SIZE]);
+                    let mut data = signal
+                        .spare
+                        .pop()
+                        .unwrap_or_else(|| Box::new([0.0f32; RENDER_QUANTUM_SIZE]));
                     data.copy_from_slice(&ch[..]);
-                    groups.push(BoundaryGroup::Samples(data));
+                    signal.groups.push(BoundaryGroup::Samples(data));
                 }
-                channel_groups.push(gi);
+                signal.channel_groups.push(gi);
             }
         }
 
-        BoundarySignal {
-            single_valued: self.single_valued,
-            channel_groups,
-            groups,
-        }
+        signal.single_valued = self.single_valued;
+        signal.epoch = epoch;
     }
 }
 
@@ -702,6 +722,10 @@ pub(crate) struct BoundarySignal {
     /// share a backing buffer (reproducing the producer's pointer sharing).
     channel_groups: ArrayVec<u8, MAX_CHANNELS>,
     groups: ArrayVec<BoundaryGroup, MAX_CHANNELS>,
+    /// Sample blocks kept for reuse by the next quantum's `write_boundary`.
+    spare: ArrayVec<Box<[f32; RENDER_QUANTUM_SIZE]>, MAX_CHANNELS>,
+    /// The render epoch (quantum) this signal was written in.
+    pub(crate) epoch: u64,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
