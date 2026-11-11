@@ -599,6 +599,7 @@ impl BiquadFilterNode {
                 q: q_proc,
                 type_,
                 xy: ArrayVec::new(),
+                coefs: Box::new([Coefficients::default(); RENDER_QUANTUM_SIZE]),
             };
 
             let node = Self {
@@ -759,6 +760,9 @@ struct BiquadFilterRenderer {
     type_: BiquadFilterType,
     // keep filter state for each channel
     xy: ArrayVec<[f64; 4], MAX_CHANNELS>,
+    // per-frame coefficients while a param is a-rate (allocated once, at
+    // construction on the control thread)
+    coefs: Box<[Coefficients; RENDER_QUANTUM_SIZE]>,
 }
 
 impl AudioProcessor for BiquadFilterRenderer {
@@ -831,10 +835,14 @@ impl AudioProcessor for BiquadFilterRenderer {
             f64::from(q[0]),
         );
 
-        let mut coefs_list = [coef; RENDER_QUANTUM_SIZE];
         // if one of the params has a length of RENDER_QUANTUM_SIZE, we need
-        // to compute the coefs for each frame
-        if frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1 {
+        // to compute the coefs for each frame (into the renderer's own buffer:
+        // a static filter neither fills nor reads a 128-entry list)
+        let automated =
+            frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1;
+        if automated {
+            let coefs_list = &mut *self.coefs;
+            coefs_list[0] = coef;
             // Recompute only when an input actually changes from the previous
             // frame (compared bit for bit: -0.0 and 0.0 may give different
             // coefficients). Identical inputs give identical coefficients,
@@ -892,10 +900,17 @@ impl AudioProcessor for BiquadFilterRenderer {
             let [st_l, st_r] = &mut self.xy[..] else {
                 unreachable!()
             };
-            stereo::process(&coefs_list, in_l, in_r, out_l, out_r, st_l, st_r);
+            if automated {
+                let list = &*self.coefs;
+                stereo::process(|i| list[i], in_l, in_r, out_l, out_r, st_l, st_r);
+            } else {
+                stereo::process(|_| coef, in_l, in_r, out_l, out_r, st_l, st_r);
+            }
             return true;
         }
 
+        let coefs_list = &*self.coefs;
+        let coef_at = |i: usize| if automated { coefs_list[i] } else { coef };
         for (channel_number, output_channel) in output.channels_mut().iter_mut().enumerate() {
             let input_channel = if input.is_silent() {
                 input.channel_data(0)
@@ -910,8 +925,9 @@ impl AudioProcessor for BiquadFilterRenderer {
             output_channel
                 .iter_mut()
                 .zip(input_channel.iter())
-                .zip(coefs_list.iter())
-                .for_each(|((o, &i), c)| {
+                .enumerate()
+                .for_each(|(frame, (o, &i))| {
+                    let c = &coef_at(frame);
                     // 𝑎0𝑦(𝑛)+𝑎1𝑦(𝑛−1)+𝑎2𝑦(𝑛−2)=𝑏0𝑥(𝑛)+𝑏1𝑥(𝑛−1)+𝑏2𝑥(𝑛−2)
                     // as all coefs are normalized against 𝑎0, we get
                     // 𝑦(𝑛) = 𝑏0𝑥(𝑛) + 𝑏1𝑥(𝑛−1) + 𝑏2𝑥(𝑛−2) - 𝑎1𝑦(𝑛−1) - 𝑎2𝑦(𝑛−2)
@@ -1052,8 +1068,11 @@ mod stereo {
 
     use lanes::*;
 
+    /// `coef(i)`: frame i's coefficients. Static filters pass a closure that
+    /// returns one value, so the five splats leave the loop.
+    #[inline(always)]
     pub(super) fn process(
-        coefs: &[Coefficients; RENDER_QUANTUM_SIZE],
+        coef: impl Fn(usize) -> Coefficients,
         in_l: &[f32],
         in_r: &[f32],
         out_l: &mut [f32],
@@ -1066,7 +1085,7 @@ mod stereo {
         let mut y1 = pair(st_l[2], st_r[2]);
         let mut y2 = pair(st_l[3], st_r[3]);
         for i in 0..RENDER_QUANTUM_SIZE {
-            let c = &coefs[i];
+            let c = &coef(i);
             let x = pair(f64::from(in_l[i]), f64::from(in_r[i]));
             // ((((b0 x + b1 x1) + b2 x2) - a1 y1) - a2 y2), as the scalar code
             let mut y = mul(splat(c.b0), x);
@@ -1158,7 +1177,7 @@ mod stereo {
                     il = [0.; RENDER_QUANTUM_SIZE]; // decaying tail
                 }
                 let (mut ol, mut or) = ([0f32; RENDER_QUANTUM_SIZE], [0f32; RENDER_QUANTUM_SIZE]);
-                process(&coefs, &il, &ir, &mut ol, &mut or, &mut sl, &mut sr);
+                process(|i| coefs[i], &il, &ir, &mut ol, &mut or, &mut sl, &mut sr);
                 let (mut el, mut er) = ([0f32; RENDER_QUANTUM_SIZE], [0f32; RENDER_QUANTUM_SIZE]);
                 scalar(&coefs, &il, &mut el, &mut rl);
                 scalar(&coefs, &ir, &mut er, &mut rr);
