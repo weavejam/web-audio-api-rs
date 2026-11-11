@@ -835,6 +835,19 @@ impl AudioProcessor for BiquadFilterRenderer {
         // if one of the params has a length of RENDER_QUANTUM_SIZE, we need
         // to compute the coefs for each frame
         if frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1 {
+            // Recompute only when an input actually changes from the previous
+            // frame (compared bit for bit: -0.0 and 0.0 may give different
+            // coefficients). Identical inputs give identical coefficients,
+            // so this is bit-exact; it saves the f64 trig of every frame of
+            // a param that is a-rate but holding still (an automation lane
+            // between breakpoints, a step, a slow ramp in f32 steps).
+            let mut prev = [
+                frequency[0].to_bits(),
+                detune[0].to_bits(),
+                q[0].to_bits(),
+                gain[0].to_bits(),
+            ];
+            let mut prev_coef = coef;
             coefs_list
                 .iter_mut()
                 .zip(frequency.iter().cycle())
@@ -843,16 +856,45 @@ impl AudioProcessor for BiquadFilterRenderer {
                 .zip(gain.iter().cycle())
                 .skip(1)
                 .for_each(|((((coefs, &f), &d), &q), &g)| {
-                    let computed_freq = get_computed_freq(f, d);
-                    *coefs = calculate_coefs(
-                        type_,
-                        sample_rate_f64,
-                        f64::from(computed_freq),
-                        f64::from(g),
-                        f64::from(q),
-                    );
+                    let key = [f.to_bits(), d.to_bits(), q.to_bits(), g.to_bits()];
+                    if key != prev {
+                        let computed_freq = get_computed_freq(f, d);
+                        prev_coef = calculate_coefs(
+                            type_,
+                            sample_rate_f64,
+                            f64::from(computed_freq),
+                            f64::from(g),
+                            f64::from(q),
+                        );
+                        prev = key;
+                    }
+                    *coefs = prev_coef;
                 });
         };
+
+        // Stereo: both channels in one 2-lane f64 register (SSE2 / NEON, the
+        // baseline of x86_64 / aarch64). Each lane runs exactly the scalar
+        // recurrence below (same op order, no FMA), so the output is
+        // bit-identical; the win is that the two serial dependency chains
+        // overlap (~3x on the filter loop).
+        #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+        if self.xy.len() == 2 {
+            let silent = input.is_silent();
+            let in_l = input.channel_data(0);
+            let in_r = if silent {
+                input.channel_data(0)
+            } else {
+                input.channel_data(1)
+            };
+            let mut outs = output.channels_mut().iter_mut();
+            let out_l = outs.next().unwrap();
+            let out_r = outs.next().unwrap();
+            let [st_l, st_r] = &mut self.xy[..] else {
+                unreachable!()
+            };
+            stereo::process(&coefs_list, in_l, in_r, out_l, out_r, st_l, st_r);
+            return true;
+        }
 
         for (channel_number, output_channel) in output.channels_mut().iter_mut().enumerate() {
             let input_channel = if input.is_silent() {
@@ -905,6 +947,231 @@ impl AudioProcessor for BiquadFilterRenderer {
         }
 
         log::warn!("BiquadFilterRenderer: Dropping incoming message {msg:?}");
+    }
+}
+
+/// Stereo biquad: the two channels as the two lanes of one f64x2 register.
+/// Per lane this is exactly the scalar recurrence in `process` (same
+/// association order, no fused multiply-add, the same `is_normal` flush), so
+/// results are bit-identical to running the channels one after the other.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+mod stereo {
+    use super::Coefficients;
+    use crate::RENDER_QUANTUM_SIZE;
+
+    #[cfg(target_arch = "x86_64")]
+    mod lanes {
+        use std::arch::x86_64::*;
+        pub type V = __m128d;
+        // SSE2 is part of the x86_64 baseline: always available.
+        #[inline(always)]
+        pub fn splat(x: f64) -> V {
+            unsafe { _mm_set1_pd(x) }
+        }
+        #[inline(always)]
+        pub fn pair(l: f64, r: f64) -> V {
+            unsafe { _mm_set_pd(r, l) }
+        }
+        #[inline(always)]
+        pub fn mul(a: V, b: V) -> V {
+            unsafe { _mm_mul_pd(a, b) }
+        }
+        #[inline(always)]
+        pub fn add(a: V, b: V) -> V {
+            unsafe { _mm_add_pd(a, b) }
+        }
+        #[inline(always)]
+        pub fn sub(a: V, b: V) -> V {
+            unsafe { _mm_sub_pd(a, b) }
+        }
+        /// `if !y.is_normal() { 0 } else { y }` per lane: normal means
+        /// MIN_POSITIVE <= |y| < inf (NaN compares false -> flushed).
+        #[inline(always)]
+        pub fn flush(y: V) -> V {
+            unsafe {
+                let abs = _mm_andnot_pd(_mm_set1_pd(-0.0), y);
+                let normal = _mm_and_pd(
+                    _mm_cmpge_pd(abs, _mm_set1_pd(f64::MIN_POSITIVE)),
+                    _mm_cmplt_pd(abs, _mm_set1_pd(f64::INFINITY)),
+                );
+                _mm_and_pd(y, normal)
+            }
+        }
+        #[inline(always)]
+        pub fn split(v: V) -> (f64, f64) {
+            let mut o = [0f64; 2];
+            unsafe { _mm_storeu_pd(o.as_mut_ptr(), v) };
+            (o[0], o[1])
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    mod lanes {
+        use std::arch::aarch64::*;
+        pub type V = float64x2_t;
+        // NEON is part of the aarch64 baseline: always available.
+        #[inline(always)]
+        pub fn splat(x: f64) -> V {
+            unsafe { vdupq_n_f64(x) }
+        }
+        #[inline(always)]
+        pub fn pair(l: f64, r: f64) -> V {
+            let a = [l, r];
+            unsafe { vld1q_f64(a.as_ptr()) }
+        }
+        #[inline(always)]
+        pub fn mul(a: V, b: V) -> V {
+            unsafe { vmulq_f64(a, b) }
+        }
+        #[inline(always)]
+        pub fn add(a: V, b: V) -> V {
+            unsafe { vaddq_f64(a, b) }
+        }
+        #[inline(always)]
+        pub fn sub(a: V, b: V) -> V {
+            unsafe { vsubq_f64(a, b) }
+        }
+        #[inline(always)]
+        pub fn flush(y: V) -> V {
+            unsafe {
+                let abs = vabsq_f64(y);
+                let normal = vandq_u64(
+                    vcgeq_f64(abs, vdupq_n_f64(f64::MIN_POSITIVE)),
+                    vcltq_f64(abs, vdupq_n_f64(f64::INFINITY)),
+                );
+                vreinterpretq_f64_u64(vandq_u64(vreinterpretq_u64_f64(y), normal))
+            }
+        }
+        #[inline(always)]
+        pub fn split(v: V) -> (f64, f64) {
+            let mut o = [0f64; 2];
+            unsafe { vst1q_f64(o.as_mut_ptr(), v) };
+            (o[0], o[1])
+        }
+    }
+
+    use lanes::*;
+
+    pub(super) fn process(
+        coefs: &[Coefficients; RENDER_QUANTUM_SIZE],
+        in_l: &[f32],
+        in_r: &[f32],
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        st_l: &mut [f64; 4],
+        st_r: &mut [f64; 4],
+    ) {
+        let mut x1 = pair(st_l[0], st_r[0]);
+        let mut x2 = pair(st_l[1], st_r[1]);
+        let mut y1 = pair(st_l[2], st_r[2]);
+        let mut y2 = pair(st_l[3], st_r[3]);
+        for i in 0..RENDER_QUANTUM_SIZE {
+            let c = &coefs[i];
+            let x = pair(f64::from(in_l[i]), f64::from(in_r[i]));
+            // ((((b0 x + b1 x1) + b2 x2) - a1 y1) - a2 y2), as the scalar code
+            let mut y = mul(splat(c.b0), x);
+            y = add(y, mul(splat(c.b1), x1));
+            y = add(y, mul(splat(c.b2), x2));
+            y = sub(y, mul(splat(c.a1), y1));
+            y = sub(y, mul(splat(c.a2), y2));
+            y = flush(y);
+            x2 = x1;
+            x1 = x;
+            y2 = y1;
+            y1 = y;
+            let (l, r) = split(y);
+            out_l[i] = l as f32;
+            out_r[i] = r as f32;
+        }
+        let (a, b) = split(x1);
+        st_l[0] = a;
+        st_r[0] = b;
+        let (a, b) = split(x2);
+        st_l[1] = a;
+        st_r[1] = b;
+        let (a, b) = split(y1);
+        st_l[2] = a;
+        st_r[2] = b;
+        let (a, b) = split(y2);
+        st_l[3] = a;
+        st_r[3] = b;
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The scalar recurrence of BiquadFilterRenderer::process, verbatim.
+        fn scalar(coefs: &[Coefficients], input: &[f32], out: &mut [f32], st: &mut [f64; 4]) {
+            let [mut x1, mut x2, mut y1, mut y2] = *st;
+            for ((o, &i), c) in out.iter_mut().zip(input).zip(coefs) {
+                let x = f64::from(i);
+                let mut y = c.b0 * x + c.b1 * x1 + c.b2 * x2 - c.a1 * y1 - c.a2 * y2;
+                if !y.is_normal() {
+                    y = 0.;
+                }
+                x2 = x1;
+                x1 = x;
+                y2 = y1;
+                y1 = y;
+                *o = y as f32;
+            }
+            *st = [x1, x2, y1, y2];
+        }
+
+        #[test]
+        fn stereo_lanes_are_bit_identical_to_scalar() {
+            let mut seed = 0x1234_5678u32;
+            let mut rnd = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 8) as f32 / (1u32 << 24) as f32 * 2. - 1.
+            };
+            let (mut sl, mut sr) = ([0f64; 4], [0f64; 4]);
+            let (mut rl, mut rr) = ([0f64; 4], [0f64; 4]);
+            for block in 0..400 {
+                // per-frame coefficients (automation), resonant and extreme
+                let coefs: Vec<Coefficients> = (0..RENDER_QUANTUM_SIZE)
+                    .map(|f| {
+                        let freq = 30. + 15000. * (((block * 128 + f) as f64) * 1e-4).sin().abs();
+                        super::super::calculate_coefs(
+                            super::super::BiquadFilterType::Peaking,
+                            48000.,
+                            freq,
+                            12.,
+                            0.3 + (block % 7) as f64 * 3.,
+                        )
+                    })
+                    .collect();
+                let coefs: [Coefficients; RENDER_QUANTUM_SIZE] = coefs.try_into().ok().unwrap();
+                let mut il = [0f32; RENDER_QUANTUM_SIZE];
+                let mut ir = [0f32; RENDER_QUANTUM_SIZE];
+                for i in 0..RENDER_QUANTUM_SIZE {
+                    il[i] = rnd();
+                    ir[i] = rnd() * 1e-30; // drives the subnormal flush
+                }
+                if block % 50 == 0 {
+                    il[3] = f32::NAN;
+                    ir[9] = f32::INFINITY;
+                    il[10] = 1e-40; // subnormal input
+                }
+                if block % 13 == 0 {
+                    il = [0.; RENDER_QUANTUM_SIZE]; // decaying tail
+                }
+                let (mut ol, mut or) = ([0f32; RENDER_QUANTUM_SIZE], [0f32; RENDER_QUANTUM_SIZE]);
+                process(&coefs, &il, &ir, &mut ol, &mut or, &mut sl, &mut sr);
+                let (mut el, mut er) = ([0f32; RENDER_QUANTUM_SIZE], [0f32; RENDER_QUANTUM_SIZE]);
+                scalar(&coefs, &il, &mut el, &mut rl);
+                scalar(&coefs, &ir, &mut er, &mut rr);
+                for i in 0..RENDER_QUANTUM_SIZE {
+                    assert_eq!(ol[i].to_bits(), el[i].to_bits(), "L block {block} frame {i}");
+                    assert_eq!(or[i].to_bits(), er[i].to_bits(), "R block {block} frame {i}");
+                }
+                for k in 0..4 {
+                    assert_eq!(sl[k].to_bits(), rl[k].to_bits());
+                    assert_eq!(sr[k].to_bits(), rr[k].to_bits());
+                }
+            }
+        }
     }
 }
 
