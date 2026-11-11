@@ -173,6 +173,12 @@ pub(crate) struct Graph {
     /// Render epoch of the threaded executor, incremented once per quantum.
     #[cfg(not(target_arch = "wasm32"))]
     render_epoch: u64,
+    /// Boundary slots of the threaded executor (one per cut edge), kept
+    /// across quanta so their sample blocks are reused instead of allocated
+    /// and freed on the render threads every quantum. Each signal carries the
+    /// epoch it was written in; a merge only reads a slot of the current one.
+    #[cfg(not(target_arch = "wasm32"))]
+    boundary_store: Vec<Option<BoundarySignal>>,
     /// Measured partition costs of the last discarded plan, keyed by each
     /// partition's first node id, to seed the next plan's schedule.
     #[cfg(not(target_arch = "wasm32"))]
@@ -867,7 +873,16 @@ fn run_worker_list(
 
         let started = measure.then(std::time::Instant::now);
         for &index in &plan.partitions[pidx] {
-            process_node_threaded(nodes, plan, alloc, boundary, scope, index, &mut freeable);
+            process_node_threaded(
+                nodes,
+                plan,
+                alloc,
+                boundary,
+                scope,
+                index,
+                epoch,
+                &mut freeable,
+            );
         }
         if let Some(started) = started {
             // Exponential moving average (1/4 weight); this worker is the only
@@ -897,6 +912,7 @@ fn process_node_threaded(
     boundary: *mut Option<BoundarySignal>,
     scope: &AudioWorkletGlobalScope,
     index: AudioNodeId,
+    epoch: u64,
     freeable: &mut Vec<AudioNodeId>,
 ) {
     let node_idx = index.0 as usize;
@@ -915,6 +931,7 @@ fn process_node_threaded(
                     // this epoch was observed (Acquire) before this partition
                     // started; this index is read-only here.
                     let signal = unsafe { (*boundary.add(bidx)).as_ref() }
+                        .filter(|s| s.epoch == epoch)
                         .expect("boundary buffer filled before merge");
                     let quantum = alloc.boundary_to_quantum(signal);
                     node.inputs[slot.input_index].add(&quantum, &channel_config);
@@ -940,11 +957,10 @@ fn process_node_threaded(
 
     // 3. Copy this node's outputs into the boundary buffers of its cut edges.
     for &(output_index, bidx) in &plan.copy_out[node_idx] {
-        let signal = node.outputs[output_index].to_boundary();
         // SAFETY: this worker is the sole producer for `bidx` (one cut edge ->
         // one slot); its consumer reads it only after this partition's `done`.
         unsafe {
-            *boundary.add(bidx) = Some(signal);
+            node.outputs[output_index].write_boundary(&mut *boundary.add(bidx), epoch);
         }
     }
 
@@ -1015,6 +1031,8 @@ impl Graph {
             pool: None,
             #[cfg(not(target_arch = "wasm32"))]
             render_epoch: 0,
+            #[cfg(not(target_arch = "wasm32"))]
+            boundary_store: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             partition_cost_memory: std::collections::HashMap::new(),
         }
@@ -2026,12 +2044,16 @@ impl Graph {
         }
         plan.quanta_since_schedule += 1;
 
-        // Per-quantum boundary buffers (deep-copied cut-edge signals). Accessed
-        // from worker threads by raw pointer at disjoint indices; a merge reads a
-        // slot only after the producing partition published `done` for this epoch.
-        let mut boundary: Vec<Option<BoundarySignal>> =
-            (0..plan.boundary_count).map(|_| None).collect();
-        let boundary_base = boundary.as_mut_ptr();
+        // Boundary buffers (deep-copied cut-edge signals), persistent across
+        // quanta (see `boundary_store`). Accessed from worker threads by raw
+        // pointer at disjoint indices; a merge reads a slot only after the
+        // producing partition published `done` for this epoch.
+        if self.boundary_store.len() != plan.boundary_count {
+            self.boundary_store.truncate(plan.boundary_count);
+            self.boundary_store
+                .resize_with(plan.boundary_count, || None);
+        }
+        let boundary_base = self.boundary_store.as_mut_ptr();
 
         // Ensure the persistent worker pool matches the current worker count.
         // Spawning per quantum was measured to be a net loss (thread create/join
@@ -2117,9 +2139,6 @@ impl Graph {
             })
             .collect();
         freeables.push(own_freeable);
-
-        // Drop boundary buffers now (on this thread) before any node mutation.
-        drop(boundary);
 
         // Join: decommission end-of-life nodes serially (mirrors `render()`), in
         // `ordered` sequence for deterministic reclaim ordering.
