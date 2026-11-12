@@ -281,6 +281,8 @@ pub(crate) struct Graph {
     orphaned_params: Vec<AudioNodeId>,
     /// CPUs this process may run on (see [`cpu_limit::usable_cpus`]); the
     /// threaded executor never uses more threads. Refreshed when
+    /// CPUs (or, for [`ALL_CORES`], physical cores) this process may run on
+    /// (see [`cpu_limit`]); the threaded executor never uses more threads. Refreshed when
     /// `cpu_limit_age` wraps to 0.
     #[cfg(not(target_arch = "wasm32"))]
     cpu_limit: usize,
@@ -449,6 +451,10 @@ impl UnionFind {
 // ---------------------------------------------------------------------------
 // Multicore executor (native only)
 // ---------------------------------------------------------------------------
+
+/// `parallel_workers` value for "one thread per usable physical core".
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const ALL_CORES: usize = usize::MAX;
 
 /// Quanta between re-schedules from the measured partition costs.
 #[cfg(not(target_arch = "wasm32"))]
@@ -703,6 +709,11 @@ impl WorkerPool {
 /// ignores the process affinity on Windows, and on Linux it also reads cgroup
 /// files, which the render thread must not do; so both are queried directly.
 /// Cheap enough (one syscall) to call on the render thread now and then.
+///
+/// [`usable_cores`] counts physical cores instead (SMT siblings once): the
+/// "all cores" setting uses that, as a second hardware thread on a busy core
+/// adds little to a render and slows the thread it shares the core with.
+/// The core topology is read once ([`prime`]), off the render thread.
 #[cfg(not(target_arch = "wasm32"))]
 mod cpu_limit {
     fn logical_cpus() -> usize {
@@ -710,9 +721,69 @@ mod cpu_limit {
         *LOGICAL.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
     }
 
+    /// Per logical CPU: whether a lower-numbered CPU shares its physical core.
+    /// Empty if the topology is unknown (then every CPU counts as a core).
+    fn smt_sibling_of_lower() -> &'static [bool] {
+        static TOPOLOGY: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
+        TOPOLOGY.get_or_init(read_topology)
+    }
+
+    /// Read the core topology now, so [`usable_cores`] never does on the
+    /// render thread.
+    pub(super) fn prime() {
+        let _ = smt_sibling_of_lower();
+    }
+
+    /// Number of physical cores among the CPUs this process may run on.
+    pub(super) fn usable_cores() -> usize {
+        let lower = smt_sibling_of_lower();
+        let mut cores = 0;
+        let mut any = false;
+        for_each_usable_cpu(|cpu| {
+            any = true;
+            if !lower.get(cpu).copied().unwrap_or(false) {
+                cores += 1;
+            }
+        });
+        if any {
+            cores.max(1)
+        } else {
+            usable_cpus()
+        }
+    }
+
+    /// From groups of CPUs that share a core, mark every CPU above the lowest
+    /// of its group.
+    #[cfg_attr(
+        not(any(target_os = "windows", target_os = "linux", target_os = "android")),
+        allow(dead_code)
+    )]
+    fn mark_siblings(groups: impl Iterator<Item = Vec<usize>>) -> Vec<bool> {
+        let mut lower = Vec::new();
+        for mut group in groups {
+            group.sort_unstable();
+            for &cpu in group.iter().skip(1) {
+                if lower.len() <= cpu {
+                    lower.resize(cpu + 1, false);
+                }
+                lower[cpu] = true;
+            }
+        }
+        lower
+    }
+
     #[cfg(target_os = "windows")]
-    pub(super) fn usable_cpus() -> usize {
+    mod os {
         use std::ffi::c_void;
+
+        #[repr(C)]
+        struct LogicalProcessorInformation {
+            processor_mask: usize,
+            relationship: u32,
+            union: [u64; 2],
+        }
+        const RELATION_PROCESSOR_CORE: u32 = 0;
+
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentProcess() -> *mut c_void;
@@ -721,38 +792,134 @@ mod cpu_limit {
                 process_mask: *mut usize,
                 system_mask: *mut usize,
             ) -> i32;
+            fn GetLogicalProcessorInformation(
+                buffer: *mut LogicalProcessorInformation,
+                length: *mut u32,
+            ) -> i32;
         }
-        let mut process_mask = 0usize;
-        let mut system_mask = 0usize;
-        // SAFETY: pseudo-handle of the current process and two valid out
-        // pointers for the duration of the call.
-        let ok = unsafe {
-            GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
+
+        /// The process affinity mask, or `None` when the process spans
+        /// several processor groups (> 64 CPUs; both masks are then 0).
+        pub(super) fn process_mask() -> Option<usize> {
+            let mut process_mask = 0usize;
+            let mut system_mask = 0usize;
+            // SAFETY: pseudo-handle of the current process and two valid out
+            // pointers for the duration of the call.
+            let ok = unsafe {
+                GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
+            };
+            (ok != 0 && process_mask != 0).then_some(process_mask)
+        }
+
+        pub(super) fn core_groups() -> Vec<Vec<usize>> {
+            let entry = std::mem::size_of::<LogicalProcessorInformation>();
+            let mut length = 0u32;
+            // SAFETY: a null buffer with length 0 only queries the size.
+            unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut length) };
+            let mut buffer: Vec<LogicalProcessorInformation> = (0..length as usize / entry + 1)
+                .map(|_| LogicalProcessorInformation {
+                    processor_mask: 0,
+                    relationship: u32::MAX,
+                    union: [0; 2],
+                })
+                .collect();
+            let mut length = (buffer.len() * entry) as u32;
+            // SAFETY: `buffer` holds `length` bytes of properly aligned entries.
+            if unsafe { GetLogicalProcessorInformation(buffer.as_mut_ptr(), &mut length) } == 0 {
+                return Vec::new();
+            }
+            buffer.truncate(length as usize / entry);
+            buffer
+                .iter()
+                .filter(|info| info.relationship == RELATION_PROCESSOR_CORE)
+                .map(|info| {
+                    (0..usize::BITS as usize)
+                        .filter(|bit| info.processor_mask & (1 << bit) != 0)
+                        .collect()
+                })
+                .collect()
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    fn read_topology() -> Vec<bool> {
+        mark_siblings(os::core_groups().into_iter())
+    }
+
+    #[cfg(target_os = "windows")]
+    fn for_each_usable_cpu(mut f: impl FnMut(usize)) {
+        if let Some(mask) = os::process_mask() {
+            (0..usize::BITS as usize)
+                .filter(|bit| mask & (1 << bit) != 0)
+                .for_each(&mut f);
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn usable_cpus() -> usize {
+        os::process_mask().map_or_else(logical_cpus, |mask| mask.count_ones() as usize)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn affinity() -> Option<libc::cpu_set_t> {
+        // SAFETY: `cpu_set_t` is a plain bit set (all-zero is valid) and the
+        // pointer and size describe it for the duration of the call.
+        unsafe {
+            let mut set: libc::cpu_set_t = std::mem::zeroed();
+            (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0
+                && libc::CPU_COUNT(&set) > 0)
+                .then_some(set)
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_topology() -> Vec<bool> {
+        let read = |cpu: usize, what: &str| {
+            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{what}"))
+                .ok()
+                .and_then(|s| s.trim().parse::<i64>().ok())
         };
-        // Both masks are 0 when the process spans several processor groups
-        // (> 64 CPUs); then fall back to the logical count.
-        if ok != 0 && process_mask != 0 {
-            process_mask.count_ones() as usize
-        } else {
-            logical_cpus()
+        let mut by_core: std::collections::BTreeMap<(i64, i64), Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for cpu in 0..logical_cpus().max(1) * 4 {
+            if let (Some(package), Some(core)) =
+                (read(cpu, "physical_package_id"), read(cpu, "core_id"))
+            {
+                by_core.entry((package, core)).or_default().push(cpu);
+            }
+        }
+        mark_siblings(by_core.into_values())
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn for_each_usable_cpu(mut f: impl FnMut(usize)) {
+        if let Some(set) = affinity() {
+            // CPU_SETSIZE is a c_int on glibc, a usize on Android.
+            #[allow(trivial_numeric_casts)]
+            let size = libc::CPU_SETSIZE as usize;
+            for cpu in 0..size {
+                // SAFETY: `cpu` is below CPU_SETSIZE.
+                if unsafe { libc::CPU_ISSET(cpu, &set) } {
+                    f(cpu);
+                }
+            }
         }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     pub(super) fn usable_cpus() -> usize {
-        // SAFETY: `cpu_set_t` is a plain bit set (all-zero is valid) and the
-        // pointer and size describe it for the duration of the call.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0 {
-                let n = libc::CPU_COUNT(&set);
-                if n > 0 {
-                    return n as usize;
-                }
-            }
-        }
-        logical_cpus()
+        // SAFETY: `set` is a valid, initialized cpu set.
+        affinity().map_or_else(logical_cpus, |set| unsafe { libc::CPU_COUNT(&set) }
+            as usize)
     }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+    fn read_topology() -> Vec<bool> {
+        Vec::new()
+    }
+
+    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
+    fn for_each_usable_cpu(_f: impl FnMut(usize)) {}
 
     #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
     pub(super) fn usable_cpus() -> usize {
@@ -762,10 +929,22 @@ mod cpu_limit {
     #[cfg(test)]
     mod tests {
         #[test]
-        fn usable_cpus_within_logical() {
-            let n = super::usable_cpus();
-            assert!(n >= 1);
-            eprintln!("usable CPUs: {n} of {}", super::logical_cpus());
+        fn usable_cores_and_cpus() {
+            super::prime();
+            let cpus = super::usable_cpus();
+            let cores = super::usable_cores();
+            assert!(cpus >= 1);
+            assert!(cores >= 1 && cores <= cpus, "{cores} cores > {cpus} CPUs");
+            eprintln!(
+                "usable: {cores} cores, {cpus} CPUs of {} logical",
+                super::logical_cpus()
+            );
+        }
+
+        #[test]
+        fn siblings_marked_above_the_lowest() {
+            let lower = super::mark_siblings([vec![3, 1], vec![0], vec![2, 5, 4]].into_iter());
+            assert_eq!(lower, vec![false, false, false, true, true, true]);
         }
     }
 }
@@ -1190,19 +1369,23 @@ impl Graph {
         let partitioned = false;
 
         // Multicore executor opt-in (native only). `WEB_AUDIO_RS_PARALLEL=1|true`
-        // uses all CPUs this process may run on; an explicit integer sets the
-        // worker count. Either way the executor clamps it to the usable CPUs
-        // on every re-schedule (see `cpu_limit`).
+        // uses one thread per physical core this process may run on
+        // (`ALL_CORES`); an explicit integer sets the worker count, clamped to
+        // the usable CPUs. Both are re-checked every re-schedule (`cpu_limit`).
         #[cfg(not(target_arch = "wasm32"))]
         let parallel_workers = std::env::var("WEB_AUDIO_RS_PARALLEL").ok().map_or(0, |v| {
             if v == "1" || v == "true" {
-                usize::MAX
+                ALL_CORES
             } else {
                 v.parse::<usize>().unwrap_or(0)
             }
         });
         #[cfg(target_arch = "wasm32")]
         let parallel_workers = 0;
+        #[cfg(not(target_arch = "wasm32"))]
+        if parallel_workers == ALL_CORES {
+            cpu_limit::prime();
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         let inline_params =
@@ -1264,10 +1447,15 @@ impl Graph {
     ///
     /// Takes precedence over the `WEB_AUDIO_RS_PARALLEL` env var read in
     /// [`Graph::new`]. `0` or `1` render serially; `n >= 2` renders across `n`
-    /// threads (byte-identical to serial). No-op in effect on wasm, where the
-    /// parallel executor is not compiled in.
+    /// threads (byte-identical to serial), at most one per usable CPU;
+    /// [`ALL_CORES`] one per usable physical core. No-op in effect on wasm,
+    /// where the parallel executor is not compiled in.
     pub(crate) fn set_parallel_workers(&mut self, workers: usize) {
         self.parallel_workers = workers;
+        #[cfg(not(target_arch = "wasm32"))]
+        if workers == ALL_CORES {
+            cpu_limit::prime();
+        }
     }
 
     /// Whether [`Graph::render_quantum`] renders on the worker pool.
@@ -2394,9 +2582,10 @@ impl Graph {
     /// output that is byte-identical to [`Graph::render`].
     ///
     /// Partitions (independent sub-graphs between fan-in points — see
-    /// [`PartitionPlan`]) are statically pinned to worker threads and rendered a
-    /// DAG-level at a time: all partitions in a level run concurrently, then a
-    /// barrier, then the next level. Cross-partition (cut) edges are carried as
+    /// [`PartitionPlan`]) run as soon as their producers completed, on whichever
+    /// thread takes them: each thread prefers its own scheduled list, idle threads
+    /// take any ready partition, and the calling thread stays until all are done.
+    /// Cross-partition (cut) edges are carried as
     /// deep-copied [`BoundarySignal`]s, so partitions never share a buffer
     /// through a cut edge. Merge nodes sum their boundary inputs in the
     /// exact `ordered` fold the serial path uses, so the result bits do not
@@ -2410,7 +2599,11 @@ impl Graph {
         // without a core of its own only stalls the others. Re-read every
         // RESCHEDULE_QUANTA quanta, so a changed affinity is followed.
         if self.cpu_limit_age == 0 {
-            self.cpu_limit = cpu_limit::usable_cpus();
+            self.cpu_limit = if self.parallel_workers == ALL_CORES {
+                cpu_limit::usable_cores()
+            } else {
+                cpu_limit::usable_cpus()
+            };
         }
         self.cpu_limit_age = (self.cpu_limit_age + 1) % RESCHEDULE_QUANTA;
         let n_workers = self.parallel_workers.min(self.cpu_limit);
