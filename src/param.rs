@@ -680,6 +680,13 @@ pub(crate) struct AudioParamProcessor {
     event_timeline: AudioParamEventTimeline,
     last_event: Option<AudioParamEvent>,
     buffer: ArrayVec<f32, RENDER_QUANTUM_SIZE>,
+    /// Idle fast path: `(intrinsic value bits, output sample bits)` of the last
+    /// quantum that started with an empty timeline and a silent input. Such a
+    /// quantum's output is one clamped sample, a pure function of the intrinsic
+    /// value (`compute_buffer` + `mix_to_output`). While the timeline stays
+    /// empty, the input silent and the intrinsic value unchanged, the output
+    /// buffer already holds the result, so the computation is skipped.
+    idle_output: Option<(u32, u32)>,
 }
 
 impl AudioProcessor for AudioParamProcessor {
@@ -690,18 +697,45 @@ impl AudioProcessor for AudioParamProcessor {
         _params: AudioParamValues<'_>,
         scope: &AudioWorkletGlobalScope,
     ) -> bool {
-        let period = 1. / scope.sample_rate as f64;
-
         let input = &inputs[0]; // single input mode
         let output = &mut outputs[0];
 
+        let idle = self.event_timeline.is_empty() && input.is_silent();
+        if idle {
+            if let Some((intrinsic, value)) = self.idle_output {
+                if intrinsic == self.intrinsic_value.to_bits()
+                    && output.single_valued()
+                    && output.channel_data(0)[0].to_bits() == value
+                {
+                    // As `compute_buffer` does: [[current value]] is the
+                    // intrinsic value at the start of the quantum.
+                    let clamped = self.intrinsic_value.clamp(self.min_value, self.max_value);
+                    self.current_value.store(clamped, Ordering::Release);
+                    return true; // has intrinsic value
+                }
+            }
+        }
+
+        let period = 1. / scope.sample_rate as f64;
         self.compute_intrinsic_values(scope.current_time, period, RENDER_QUANTUM_SIZE);
         self.mix_to_output(input, output);
+
+        self.idle_output = if idle && output.single_valued() {
+            Some((
+                self.intrinsic_value.to_bits(),
+                output.channel_data(0)[0].to_bits(),
+            ))
+        } else {
+            None
+        };
 
         true // has intrinsic value
     }
 
     fn onmessage(&mut self, msg: &mut dyn Any) {
+        // A message may change what the next quantum computes.
+        self.idle_output = None;
+
         if let Some(automation_rate) = msg.downcast_ref::<AutomationRate>() {
             self.automation_rate = *automation_rate;
             return;
@@ -1648,6 +1682,7 @@ pub(crate) fn audio_param_pair(
         event_timeline: AudioParamEventTimeline::new(),
         last_event: None,
         buffer: ArrayVec::new(),
+        idle_output: None,
     };
 
     (param, processor)
