@@ -710,10 +710,10 @@ impl WorkerPool {
 /// files, which the render thread must not do; so both are queried directly.
 /// Cheap enough (one syscall) to call on the render thread now and then.
 ///
-/// [`usable_cores`] counts physical cores instead (SMT siblings once): the
+/// `usable_cores` counts physical cores instead (SMT siblings once): the
 /// "all cores" setting uses that, as a second hardware thread on a busy core
 /// adds little to a render and slows the thread it shares the core with.
-/// The core topology is read once ([`prime`]), off the render thread.
+/// The core topology is read once (`prime`), off the render thread.
 #[cfg(not(target_arch = "wasm32"))]
 mod cpu_limit {
     fn logical_cpus() -> usize {
