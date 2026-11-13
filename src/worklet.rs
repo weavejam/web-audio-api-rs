@@ -34,6 +34,18 @@ impl std::fmt::Debug for AudioParamValues<'_> {
 }
 
 impl<'a> AudioParamValues<'a> {
+    /// Whether all declared parameters are single-valued and bit-identical to
+    /// the previous render quantum. This is a conservative, constant-time hint:
+    /// `false` means values must be read, not necessarily that they changed.
+    ///
+    /// Always false after graph reordering or a parameter message, while any
+    /// parameter has automation pending, or while audio is connected to one.
+    /// A caller that did not consume the previous quantum's values must refresh
+    /// its own cache even when this returns true.
+    pub fn unchanged(&self) -> bool {
+        self.values.unchanged
+    }
+
     /// Get the computed values for the given [`AudioParam`]
     ///
     /// For k-rate params or if the (a-rate) parameter is constant for this block, it will provide
@@ -714,6 +726,124 @@ mod tests {
             abs_all <= 0.
         );
         assert_eq!(worklet.reported_latency_samples(), 42);
+    }
+
+    #[test]
+    fn test_unchanged_params_follow_messages_automation_and_connections() {
+        use crate::node::AudioScheduledSourceNode;
+        use std::sync::Mutex;
+
+        type Rows = Arc<Mutex<Vec<(bool, Vec<Vec<u32>>)>>>;
+        struct Probe(Rows);
+        impl AudioWorkletProcessor for Probe {
+            type ProcessorOptions = Rows;
+
+            fn constructor(rows: Rows) -> Self {
+                Self(rows)
+            }
+
+            fn parameter_descriptors() -> Vec<AudioParamDescriptor> {
+                ["gain", "idle"]
+                    .map(|name| AudioParamDescriptor {
+                        name: name.into(),
+                        automation_rate: crate::AutomationRate::A,
+                        default_value: 0.25,
+                        min_value: -10.,
+                        max_value: 10.,
+                    })
+                    .into()
+            }
+
+            fn process<'a, 'b>(
+                &mut self,
+                _inputs: &'b [&'a [&'a [f32]]],
+                outputs: &'b mut [&'a mut [&'a mut [f32]]],
+                params: AudioParamValues<'b>,
+                _scope: &'b AudioWorkletGlobalScope,
+            ) -> bool {
+                let values = ["gain", "idle"]
+                    .map(|name| params.get(name).iter().map(|x| x.to_bits()).collect())
+                    .into();
+                self.0.lock().unwrap().push((params.unchanged(), values));
+                outputs[0][0].fill(params.get("gain")[0]);
+                true
+            }
+        }
+
+        let q = 128. / 48000.;
+        let mut ctx = OfflineAudioContext::new(1, 24 * 128, 48000.);
+        let rows: Rows = Arc::default();
+        let node = AudioWorkletNode::new::<Probe>(
+            &ctx,
+            AudioWorkletNodeOptions {
+                processor_options: Arc::clone(&rows),
+                ..AudioWorkletNodeOptions::default()
+            },
+        );
+        node.connect(&ctx.destination());
+        let node = Arc::new(node);
+        let mut source = ctx.create_constant_source();
+        source.offset().set_value(0.125);
+        source.start();
+        let source = Arc::new(source);
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(3. * q, move |_| {
+                node.parameters()
+                    .get("gain")
+                    .unwrap()
+                    .set_value_at_time(0.5, 5.25 * q);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(8. * q, move |_| {
+                node.parameters().get("gain").unwrap().set_value(-0.);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(12. * q, move |_| {
+                node.parameters()
+                    .get("gain")
+                    .unwrap()
+                    .set_automation_rate(crate::AutomationRate::K);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            let source = Arc::clone(&source);
+            ctx.suspend_sync(14. * q, move |_| {
+                source.connect(node.parameters().get("gain").unwrap());
+            });
+        }
+        {
+            let source = Arc::clone(&source);
+            ctx.suspend_sync(18. * q, move |_| source.disconnect());
+        }
+        {
+            let source = Arc::clone(&source);
+            // Removing an acyclic edge preserves the existing render order.
+            // A later re-plan can make the disconnected param inline again.
+            ctx.suspend_sync(20. * q, move |ctx| {
+                source.connect(&ctx.destination());
+            });
+        }
+        ctx.start_rendering_sync();
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows.len(), 24);
+        assert!(!rows[0].0);
+        assert!(rows[2].0, "settled params should certify unchanged values");
+        for i in [3, 4, 5, 8, 12, 14, 15, 16, 17, 18] {
+            assert!(!rows[i].0, "invalid certificate at quantum {i}");
+        }
+        assert!(rows[23].0, "disconnected params should settle again");
+        for pair in rows.windows(2) {
+            if pair[1].0 {
+                assert!(pair[1].1.iter().all(|p| p.len() == 1));
+                assert_eq!(pair[0].1, pair[1].1, "certificate must preserve every bit");
+            }
+        }
     }
 
     #[test]

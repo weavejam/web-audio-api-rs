@@ -253,6 +253,7 @@ impl Deref for DerefAudioRenderQuantumChannel<'_> {
 /// Provided to implementations of [`AudioProcessor`] in the render thread
 pub struct AudioParamValues<'a> {
     nodes: &'a NodeCollection,
+    pub(crate) unchanged: bool,
 }
 
 impl std::fmt::Debug for AudioParamValues<'_> {
@@ -263,7 +264,10 @@ impl std::fmt::Debug for AudioParamValues<'_> {
 
 impl<'a> AudioParamValues<'a> {
     pub(crate) fn from(nodes: &'a NodeCollection) -> Self {
-        Self { nodes }
+        Self {
+            nodes,
+            unchanged: false,
+        }
     }
 
     /// Get the computed values for the given [`crate::param::AudioParam`]

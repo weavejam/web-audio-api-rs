@@ -45,6 +45,8 @@ pub use message_port::MessagePort;
 
 mod param;
 pub use param::*;
+#[cfg(feature = "param-profile")]
+pub mod param_profile;
 
 mod periodic_wave;
 pub use periodic_wave::*;

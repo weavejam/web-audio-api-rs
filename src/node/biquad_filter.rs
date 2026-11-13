@@ -774,6 +774,8 @@ impl AudioProcessor for BiquadFilterRenderer {
         scope: &AudioWorkletGlobalScope,
     ) -> bool {
         // single input/output node
+        #[cfg(feature = "param-profile")]
+        let _timer = crate::param_profile::Timer::new(5);
         let input = &inputs[0];
         let output = &mut outputs[0];
         let sample_rate = scope.sample_rate;
@@ -819,6 +821,8 @@ impl AudioProcessor for BiquadFilterRenderer {
         }
 
         // get a-rate parameters
+        #[cfg(feature = "param-profile")]
+        let setup_timer = crate::param_profile::Timer::new(6);
         let type_ = self.type_;
         let frequency = params.get(&self.frequency);
         let detune = params.get(&self.detune);
@@ -840,6 +844,8 @@ impl AudioProcessor for BiquadFilterRenderer {
         // a static filter neither fills nor reads a 128-entry list)
         let automated =
             frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1;
+        #[cfg(feature = "param-profile")]
+        drop(setup_timer);
         if automated {
             let coefs_list = &mut *self.coefs;
             coefs_list[0] = coef;
