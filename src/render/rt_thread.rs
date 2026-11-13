@@ -535,4 +535,38 @@ mod tests {
              concurrent: {held_ok}/{n} held (error {held_err})"
         );
     }
+
+    // Diagnostic (run with --ignored --nocapture): what a callback thread's
+    // one-time promotion costs, i.e. what the first render() on a cpal
+    // callback thread pays (and, since the timer starts first, reports).
+    #[test]
+    #[ignore]
+    fn promotion_cost_probe() {
+        let mut us: Vec<f64> = (0..200)
+            .map(|_| {
+                std::thread::spawn(|| {
+                    let t = std::time::Instant::now();
+                    super::ensure_callback_thread_promoted();
+                    let first = t.elapsed().as_secs_f64() * 1e6;
+                    let t = std::time::Instant::now();
+                    super::ensure_callback_thread_promoted();
+                    (first, t.elapsed().as_secs_f64() * 1e6)
+                })
+                .join()
+                .unwrap()
+            })
+            .map(|(first, again)| {
+                assert!(again < first);
+                first
+            })
+            .collect();
+        us.sort_by(f64::total_cmp);
+        eprintln!(
+            "first-callback promotion: min {:.1} us, median {:.1} us, p95 {:.1} us, max {:.1} us \n             (128 frames at 48 kHz = 2667 us)",
+            us[0],
+            us[us.len() / 2],
+            us[us.len() * 95 / 100],
+            us[us.len() - 1]
+        );
+    }
 }

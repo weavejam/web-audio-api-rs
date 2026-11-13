@@ -419,12 +419,15 @@ impl RenderThread {
     }
 
     pub fn render<S: FromSample<f32> + Clone>(&mut self, output_buffer: &mut [S]) {
-        // Realtime scheduling for the callback thread (once per thread).
+        // Collect timing information. Started before the promotion below so
+        // a callback thread's one-time MMCSS registration (cpal gives us no
+        // hook on its thread before the first callback) counts in the stats.
+        let render_start = Instant::now();
+
+        // Realtime scheduling for the callback thread (once per thread; a
+        // backend that owns its thread promotes it at start instead).
         #[cfg(not(target_arch = "wasm32"))]
         super::rt_thread::ensure_callback_thread_promoted();
-
-        // Collect timing information
-        let render_start = Instant::now();
         let frames = output_buffer.len() / self.number_of_channels;
 
         // Perform actual rendering

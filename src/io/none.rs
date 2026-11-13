@@ -44,6 +44,11 @@ struct Callback {
 
 impl Callback {
     fn run(mut self) {
+        // This backend owns its thread: register it for realtime scheduling
+        // now, before the first deadline, instead of in the first render.
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::render::rt_thread::ensure_callback_thread_promoted();
+
         let buffer_size = RENDER_QUANTUM_SIZE; // TODO Latency Category
         let mut buffer = vec![0.; buffer_size * MAX_CHANNELS];
         let interval = Duration::from_secs_f32(buffer_size as f32 / self.sample_rate);
