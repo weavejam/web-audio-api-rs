@@ -279,6 +279,15 @@ pub(crate) struct Graph {
     /// Inline params whose owner was freed this quantum; they rejoin `ordered`
     /// once the freed nodes are trimmed from it.
     orphaned_params: Vec<AudioNodeId>,
+    /// CPUs this process may run on (see [`cpu_limit::usable_cpus`]); the
+    /// threaded executor never uses more threads. Refreshed when
+    /// CPUs (or, for [`ALL_CORES`], physical cores) this process may run on
+    /// (see [`cpu_limit`]); the threaded executor never uses more threads. Refreshed when
+    /// `cpu_limit_age` wraps to 0.
+    #[cfg(not(target_arch = "wasm32"))]
+    cpu_limit: usize,
+    #[cfg(not(target_arch = "wasm32"))]
+    cpu_limit_age: usize,
 }
 
 impl std::fmt::Debug for Graph {
@@ -357,12 +366,24 @@ struct PartitionPlan {
     /// sums at its merge nodes. The threaded executor starts `p` once these are
     /// done in the current quantum.
     preds: Vec<Vec<usize>>,
-    /// For each partition index, the worker thread it runs on. Empty until the
+    /// For each partition index, the worker thread it prefers. Empty until the
     /// threaded executor schedules the plan; the serial path ignores it.
     partition_worker: Vec<usize>,
-    /// Per worker: the partitions it renders each quantum, in order (see
-    /// [`Graph::schedule_partitions`]).
+    /// Per worker: the partitions it prefers to render each quantum, in order
+    /// (see [`Graph::schedule_partitions`]). A worker takes the next one of its
+    /// own list when it is ready, which keeps a partition's state in the same
+    /// core's cache from quantum to quantum; when its own next partition is not
+    /// ready (or another thread already took it) it takes any ready one.
     worker_lists: Vec<Vec<usize>>,
+    /// All partitions in the scheduler's global order (critical path first,
+    /// every partition after its predecessors): the order in which an idle
+    /// thread looks for a ready partition to take over.
+    steal_order: Vec<usize>,
+    /// Partition-DAG successors (inverse of `preds`).
+    succs: Vec<Vec<usize>>,
+    /// Per partition: whether it must run on worker 0, the render thread (see
+    /// [`ThreadAffinity::RenderThread`]).
+    pinned: Vec<bool>,
     /// Number of workers the plan was scheduled for. `0` means "not yet
     /// scheduled".
     assigned_workers: usize,
@@ -372,9 +393,15 @@ struct PartitionPlan {
     /// worker that runs it (one writer per quantum) and read by the scheduler
     /// between quanta. Seeded with an estimate from the node count.
     cost_ns: Vec<std::sync::atomic::AtomicU64>,
-    /// Per partition: the render epoch in which it last completed. A consumer
-    /// waits for `done[p] == epoch` of each predecessor `p`.
-    done: Vec<std::sync::atomic::AtomicU64>,
+    /// Per partition: predecessors not yet completed in the current epoch.
+    /// Reset to `preds[p].len()` by the render thread before each epoch; each
+    /// predecessor decrements it (Release) when it completes, so a partition
+    /// whose count reads 0 (Acquire) may run and sees all its inputs.
+    remaining: Vec<std::sync::atomic::AtomicU32>,
+    /// Per partition: the epoch in which a thread last claimed it. A thread
+    /// runs a partition only after swapping this to the current epoch, so each
+    /// partition runs exactly once per quantum, on whichever thread got it.
+    claimed: Vec<std::sync::atomic::AtomicU64>,
     /// Dense, indexed by `AudioNodeId.0`: whether the node is a merge node (its
     /// audio inputs are assembled via `merge_lookup`, never pushed into directly).
     is_merge: Vec<bool>,
@@ -425,6 +452,10 @@ impl UnionFind {
 // Multicore executor (native only)
 // ---------------------------------------------------------------------------
 
+/// `parallel_workers` value for "one thread per usable physical core".
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const ALL_CORES: usize = usize::MAX;
+
 /// Quanta between re-schedules from the measured partition costs.
 #[cfg(not(target_arch = "wasm32"))]
 const RESCHEDULE_QUANTA: usize = 64;
@@ -439,8 +470,9 @@ const COST_SAMPLE_QUANTA: u64 = 8;
 /// Repeatedly takes, among the partitions whose predecessors are all scheduled,
 /// the one with the longest remaining path to the end of the DAG (its "bottom
 /// level", in measured cost), and appends it to the worker that becomes free
-/// earliest (worker 0 if `pinned`). Returns the worker of each partition and
-/// each worker's list in execution order.
+/// earliest (worker 0 if `pinned`). Returns the worker of each partition, each
+/// worker's list in execution order, and the global order in which partitions
+/// were appended (a topological order, critical path first).
 ///
 /// Deadlock freedom: a partition is appended only after all its predecessors
 /// were appended (to any list), so every wait in a worker's list targets a
@@ -453,7 +485,7 @@ fn list_schedule(
     preds: &[Vec<usize>],
     pinned: &[bool],
     n_workers: usize,
-) -> (Vec<usize>, Vec<Vec<usize>>) {
+) -> (Vec<usize>, Vec<Vec<usize>>, Vec<usize>) {
     let n = costs.len();
     let n_workers = n_workers.max(1);
     let mut succs: Vec<Vec<usize>> = vec![Vec::new(); n];
@@ -480,6 +512,7 @@ fn list_schedule(
     let mut free_at = vec![0u64; n_workers];
     let mut partition_worker = vec![0usize; n];
     let mut worker_lists: Vec<Vec<usize>> = vec![Vec::new(); n_workers];
+    let mut order = Vec::with_capacity(n);
 
     while let Some((_, std::cmp::Reverse(q))) = ready.pop() {
         let w = if pinned[q] {
@@ -491,6 +524,7 @@ fn list_schedule(
         free_at[w] = finish;
         partition_worker[q] = w;
         worker_lists[w].push(q);
+        order.push(q);
         for &s in &succs[q] {
             ready_at[s] = ready_at[s].max(finish);
             missing[s] -= 1;
@@ -500,7 +534,7 @@ fn list_schedule(
         }
     }
 
-    (partition_worker, worker_lists)
+    (partition_worker, worker_lists, order)
 }
 
 /// Per-quantum render task, published by the main thread into [`PoolShared`]
@@ -547,44 +581,113 @@ impl PoolTask {
 /// The raw pointers in `task` and the `!Send` render state they reach are only
 /// touched between the start and the end of an epoch (one quantum):
 ///
-/// * Start: the main thread writes `task`, then stores the new `epoch` with
-///   Release. A worker reads `task` only after loading that epoch with Acquire,
-///   so it sees the complete task.
-/// * Dependencies: a partition's last action is storing the epoch into its
-///   `done` mark (Release). A partition reads its producers' boundary slots only
-///   after loading each producer's `done == epoch` (Acquire), so it sees the
-///   complete boundary writes. Producers always come earlier in the global
-///   schedule order (see [`list_schedule`]), so these waits cannot deadlock.
-/// * End: a worker writes its `slots[w]`, then increments `finished` (Release);
-///   the main thread loads `finished == n_workers - 1` (Acquire) before reading
-///   any slot or touching the graph again.
-/// * Disjointness: every node is touched by exactly one worker per quantum;
+/// * Start: the main thread writes `task` and resets the per-partition
+///   `remaining` counts and the epoch counters, then opens the new epoch
+///   (`open`) and only then publishes it (`epoch`, Release), so a worker that
+///   sees the new `epoch` finds it open (see [`PoolShared::start_epoch`]).
+///   A worker joins an epoch by incrementing `active`, then
+///   checking that `open` still holds that epoch (both SeqCst, against the
+///   main thread's SeqCst close followed by its read of `active`). Only a worker
+///   that joined reads `task`, so a worker that wakes late, after the quantum
+///   was finished without it, never touches its state.
+/// * Dependencies: a partition's last action is decrementing the `remaining`
+///   count of each successor (Release). A thread takes a partition only after
+///   loading `remaining == 0` (Acquire) and winning its `claimed` exchange, so
+///   it sees all its producers' boundary writes and exactly one thread runs it.
+/// * End: the main thread waits until every partition `completed`, closes the
+///   epoch, and waits for `active == 0`. A worker writes its `slots[w]` before
+///   its `active` decrement (Release), so the main thread's Acquire load orders
+///   its slot write and all its node/boundary accesses before ours.
+/// * Disjointness: every node is touched by exactly one thread per quantum
+///   (one claim per partition);
 ///   `AudioParam`/listener nodes are union-ed into the partition they feed, and
 ///   the two halves of a cycle-broken DelayNode (which share processor state
 ///   with no graph edge left between them) into one partition; each `boundary`
 ///   slot has one producer; each `slots[w]` is written only by worker `w`. So no
 ///   `RefCell<Node>`, shared processor state, boundary slot, or free-list is
 ///   ever touched by two threads at once.
-/// * Buffers: render buffers are not tied to a pool. A worker allocates from
+/// * Buffers: render buffers are not tied to a pool. A thread allocates from
 ///   and releases to its own thread-local pool, so a buffer kept in processor
-///   state that moves to another worker with its node after a re-plan just
-///   joins that worker's pool. Buffer reference counts are atomic (`Arc`), as
-///   two nodes' processor states may still share one buffer after a re-plan
-///   splits them across workers.
+///   state that runs on another thread in a later quantum just joins that
+///   thread's pool. Buffer reference counts are atomic (`Arc`), as two nodes'
+///   processor states may still share one buffer after a re-plan splits them
+///   across partitions.
 #[cfg(not(target_arch = "wasm32"))]
 struct PoolShared {
     /// The current render epoch; the main thread bumps it once per quantum to
     /// start the workers. Workers spin, then park, while it is unchanged.
     epoch: std::sync::atomic::AtomicU64,
-    /// Spawned workers that finished the current epoch.
-    finished: std::sync::atomic::AtomicUsize,
+    /// The epoch workers may still join, or 0 once the main thread closed it.
+    open: std::sync::atomic::AtomicU64,
+    /// Spawned workers inside the current epoch (joined and not yet left).
+    active: std::sync::atomic::AtomicUsize,
+    /// Partitions not yet claimed in the current epoch.
+    unclaimed: std::sync::atomic::AtomicUsize,
+    /// Partitions completed in the current epoch.
+    completed: std::sync::atomic::AtomicUsize,
     /// Set on teardown; checked by each worker while waiting for an epoch.
     shutdown: std::sync::atomic::AtomicBool,
     /// The current quantum's task, published before the epoch is bumped.
     task: std::cell::UnsafeCell<PoolTask>,
     /// Per spawned worker (index `w - 1`): end-of-life node lists, filled before
-    /// incrementing `finished`.
+    /// leaving the epoch (the `active` decrement).
     slots: Vec<std::cell::UnsafeCell<Vec<AudioNodeId>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl PoolShared {
+    fn new(n_workers: usize) -> Self {
+        PoolShared {
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            open: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            unclaimed: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
+            slots: (1..n_workers)
+                .map(|_| std::cell::UnsafeCell::new(Vec::new()))
+                .collect(),
+        }
+    }
+
+    /// Start `epoch` (main thread), once its task and counters are written.
+    /// Open it first, then publish it: a worker that saw the new `epoch` before
+    /// it was open would leave and wait for the epoch after, and the quantum
+    /// would run without it.
+    fn start_epoch(&self, epoch: u64) {
+        use std::sync::atomic::Ordering;
+        self.open.store(epoch, Ordering::SeqCst);
+        self.epoch.store(epoch, Ordering::Release);
+    }
+
+    /// Join `epoch` (a spawned worker that saw it published): announce, then
+    /// check it is still open. `false` if the main thread already closed it;
+    /// it then does not wait for us and we must not touch its state.
+    fn try_join(&self, epoch: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.active.fetch_add(1, Ordering::SeqCst);
+        if self.open.load(Ordering::SeqCst) == epoch {
+            return true;
+        }
+        self.active.fetch_sub(1, Ordering::Release);
+        false
+    }
+
+    /// Close the current epoch (main thread) so no late worker joins, then wait
+    /// for the workers still inside it to leave. Each published its free-list
+    /// before its `active` decrement (Release); the Acquire fence after our
+    /// last load orders both their slot writes and all their node/boundary
+    /// accesses before ours.
+    fn close_epoch(&self) {
+        use std::sync::atomic::Ordering;
+        self.open.store(0, Ordering::SeqCst);
+        let mut backoff = Backoff::new();
+        while self.active.load(Ordering::SeqCst) != 0 {
+            backoff.snooze();
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+    }
 }
 
 // SAFETY: see the type-level doc — all shared access is barrier-ordered and
@@ -627,15 +730,7 @@ impl WorkerPool {
         n_workers: usize,
         event_sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
     ) -> Self {
-        let shared = std::sync::Arc::new(PoolShared {
-            epoch: std::sync::atomic::AtomicU64::new(0),
-            finished: std::sync::atomic::AtomicUsize::new(0),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
-            task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
-            slots: (1..n_workers)
-                .map(|_| std::cell::UnsafeCell::new(Vec::new()))
-                .collect(),
-        });
+        let shared = std::sync::Arc::new(PoolShared::new(n_workers));
 
         let handles = (1..n_workers)
             .map(|w| {
@@ -656,6 +751,10 @@ impl WorkerPool {
     }
 }
 
+/// Thread limits of the parallel executor (affinity, cores, cgroup quota).
+#[cfg(not(target_arch = "wasm32"))]
+mod cpu_limit;
+
 /// How long an idle worker spins for the next epoch before parking. Quanta of
 /// an offline render, and the quanta within one audio callback, follow each
 /// other closely, so a worker usually picks up the next epoch while spinning
@@ -664,29 +763,54 @@ impl WorkerPool {
 #[cfg(not(target_arch = "wasm32"))]
 const IDLE_SPIN: std::time::Duration = std::time::Duration::from_micros(100);
 
-/// Spins on a dependency or completion condition before falling back to
-/// yielding the core.
+/// How long a spawned worker that finds no ready partition keeps looking
+/// (spinning, then yielding its core) before it leaves the quantum to the
+/// threads still in it. In a busy quantum partitions become ready within
+/// microseconds of each other; a longer wait means the rest of the quantum is a
+/// serial chain (e.g. the master bus), which the render thread finishes alone.
 #[cfg(not(target_arch = "wasm32"))]
-const DEPENDENCY_SPINS: u32 = 1 << 14;
+const WORKER_IDLE: std::time::Duration = std::time::Duration::from_micros(50);
 
-/// Wait until `ready()` holds: spin first (dependencies usually resolve within
-/// microseconds), then yield the core while waiting.
+/// Busy-wait iterations before a waiting thread starts yielding its core.
 #[cfg(not(target_arch = "wasm32"))]
-fn spin_then_yield(mut ready: impl FnMut() -> bool) {
-    for _ in 0..DEPENDENCY_SPINS {
-        if ready() {
-            return;
-        }
-        std::hint::spin_loop();
+const SPINS_BEFORE_YIELD: u32 = 1 << 10;
+
+/// Spin, then yield, while waiting for another thread. Never blocks: a worker
+/// that would wait long gives the quantum up instead (see [`WORKER_IDLE`]).
+#[cfg(not(target_arch = "wasm32"))]
+struct Backoff {
+    spins: u32,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Backoff {
+    fn new() -> Self {
+        Backoff { spins: 0 }
     }
-    while !ready() {
-        std::thread::yield_now();
+
+    fn reset(&mut self) {
+        self.spins = 0;
+    }
+
+    fn yielding(&self) -> bool {
+        self.spins >= SPINS_BEFORE_YIELD
+    }
+
+    fn snooze(&mut self) {
+        if self.spins < SPINS_BEFORE_YIELD {
+            self.spins += 1;
+            std::hint::spin_loop();
+        } else {
+            // Give the core to whoever is ready, e.g. a descheduled thread we
+            // are waiting for.
+            std::thread::yield_now();
+        }
     }
 }
 
-/// Wait for an epoch other than `seen`, or `None` on shutdown. Spins for
-/// [`IDLE_SPIN`], then parks; the main thread unparks every worker after
-/// storing a new epoch, and a park after that unpark returns at once.
+/// Wait for an epoch other than `seen`, or `None` on shutdown. Spins (and
+/// yields) for [`IDLE_SPIN`], then parks; the main thread unparks every worker
+/// after storing a new epoch, and a park after that unpark returns at once.
 #[cfg(not(target_arch = "wasm32"))]
 fn wait_for_epoch(shared: &PoolShared, seen: u64) -> Option<u64> {
     use std::sync::atomic::Ordering;
@@ -701,17 +825,19 @@ fn wait_for_epoch(shared: &PoolShared, seen: u64) -> Option<u64> {
             return Some(epoch);
         }
         spins = spins.wrapping_add(1);
-        if spins % 64 != 0 || start.elapsed() < IDLE_SPIN {
+        if spins % 64 != 0 {
             std::hint::spin_loop();
+        } else if start.elapsed() < IDLE_SPIN {
+            // Let a descheduled render thread (or anything else) have the core.
+            std::thread::yield_now();
         } else {
             std::thread::park();
         }
     }
 }
 
-/// Entry point of a spawned render worker. Waits for each epoch, renders its
-/// scheduled partitions for the published task, and signals completion, until
-/// shutdown.
+/// Entry point of a spawned render worker: raise its priority and render with
+/// denormals flushed, running [`worker_render_loop`] until shutdown.
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_thread_main(
     w: usize,
@@ -740,28 +866,33 @@ fn worker_thread_main(
     worker_render_loop(w, shared, sender);
 }
 
-/// The body of a render worker: wait for each epoch and render it, until
-/// shutdown.
+/// The body of a render worker: wait for each epoch, join it if it is still
+/// open, take partitions until none is left or it idled for [`WORKER_IDLE`],
+/// and leave; until shutdown.
 #[cfg(not(target_arch = "wasm32"))]
 fn worker_render_loop(
     w: usize,
     shared: &PoolShared,
     sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
 ) {
+    use std::sync::atomic::Ordering;
     // Fill this worker's buffer pool before the first quantum.
     Alloc::prewarm(64);
 
     let mut seen = 0;
     while let Some(epoch) = wait_for_epoch(shared, seen) {
         seen = epoch;
+        if !shared.try_join(epoch) {
+            continue;
+        }
         // Processor panics are caught per node; anything that unwinds out here
-        // is an executor bug. The other threads would then wait forever for
-        // this worker, so fail fast instead of hanging the render.
+        // is an executor bug. The main thread would then wait forever for this
+        // worker, so fail fast instead of hanging the render.
         let outcome = panic::catch_unwind(AssertUnwindSafe(|| {
-            // SAFETY: written before the epoch store we observed (see PoolShared).
+            // SAFETY: written before the epoch was opened (see PoolShared).
             let task = unsafe { *shared.task.get() };
             // SAFETY: the pointed-at state lives for the whole quantum (see
-            // PoolTask); this worker only reaches its own partitions' nodes.
+            // PoolTask); this worker only reaches the partitions it claims.
             let nodes: &NodeCollection = unsafe { &*task.nodes };
             let plan: &PartitionPlan = unsafe { &*task.plan };
             let scope = AudioWorkletGlobalScope {
@@ -771,8 +902,9 @@ fn worker_render_loop(
                 node_id: std::cell::Cell::new(AudioNodeId(0)),
                 event_sender: sender.clone(),
             };
-            let freeable = run_worker_list(
+            let freeable = run_partitions(
                 w,
+                shared,
                 nodes,
                 plan,
                 task.boundary,
@@ -782,7 +914,7 @@ fn worker_render_loop(
                 task.params_clean,
             );
             // SAFETY: only worker `w` writes `slots[w - 1]`; the main thread
-            // reads it after the `finished` increment below.
+            // reads it after observing `active == 0` (our decrement below).
             unsafe {
                 *shared.slots[w - 1].get() = freeable;
             }
@@ -791,20 +923,73 @@ fn worker_render_loop(
             log::error!("render worker {w} panicked outside a node; aborting");
             std::process::abort();
         }
-        shared
-            .finished
-            .fetch_add(1, std::sync::atomic::Ordering::Release);
+        shared.active.fetch_sub(1, Ordering::Release);
     }
 }
 
-/// Render worker `w`'s scheduled partitions for one quantum, in its list order.
-/// Each partition first waits until all its producers published `done` for this
-/// epoch, then runs its nodes in serial order and publishes its own `done`.
-/// Returns the end-of-life node ids it recorded.
+/// Take a partition for thread `w`: the next one of its own list if that is
+/// ready, otherwise the first ready one in the global order. `None` if nothing
+/// can be taken right now.
+#[cfg(not(target_arch = "wasm32"))]
+fn claim_partition(
+    w: usize,
+    shared: &PoolShared,
+    plan: &PartitionPlan,
+    epoch: u64,
+    cursor: &mut usize,
+) -> Option<usize> {
+    use std::sync::atomic::Ordering;
+    let try_claim = |p: usize| -> bool {
+        if plan.remaining[p].load(Ordering::Acquire) != 0 {
+            return false;
+        }
+        let claimed = &plan.claimed[p];
+        let prev = claimed.load(Ordering::Relaxed);
+        if prev == epoch
+            || claimed
+                .compare_exchange(prev, epoch, Ordering::AcqRel, Ordering::Relaxed)
+                .is_err()
+        {
+            return false;
+        }
+        shared.unclaimed.fetch_sub(1, Ordering::Relaxed);
+        true
+    };
+
+    // Own list first (cache locality); skip what other threads took.
+    let own = plan.worker_lists.get(w).map_or(&[][..], Vec::as_slice);
+    while let Some(&p) = own.get(*cursor) {
+        if plan.claimed[p].load(Ordering::Relaxed) == epoch {
+            *cursor += 1;
+            continue;
+        }
+        if try_claim(p) {
+            *cursor += 1;
+            return Some(p);
+        }
+        break;
+    }
+
+    // Then anything ready, critical path first. Only worker 0 (the render
+    // thread) may take a pinned partition.
+    plan.steal_order.iter().copied().find(|&p| {
+        (w == 0 || !plan.pinned[p])
+            && plan.claimed[p].load(Ordering::Relaxed) != epoch
+            && try_claim(p)
+    })
+}
+
+/// Render partitions on thread `w` for one quantum until none is left to take.
+/// A spawned worker also stops after idling for [`WORKER_IDLE`]. The render
+/// thread (`w == 0`) stays until every partition completed: it alone can
+/// finish the quantum, so it never waits on a worker that has not started a
+/// partition (it takes that partition itself). Returns the end-of-life node
+/// ids it recorded.
 #[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::too_many_arguments)]
-fn run_worker_list(
+fn run_partitions(
     w: usize,
+    shared: &PoolShared,
     nodes: &NodeCollection,
     plan: &PartitionPlan,
     boundary: *mut Option<BoundarySignal>,
@@ -816,37 +1001,62 @@ fn run_worker_list(
     use std::sync::atomic::Ordering;
     let alloc = &Alloc;
     let mut freeable: Vec<AudioNodeId> = Vec::new();
+    let n_partitions = plan.partitions.len();
+    let mut cursor = 0;
+    let mut backoff = Backoff::new();
+    let mut idle_since: Option<std::time::Instant> = None;
 
-    for &pidx in &plan.worker_lists[w] {
-        for &producer in &plan.preds[pidx] {
-            let done = &plan.done[producer];
-            spin_then_yield(|| done.load(Ordering::Acquire) == epoch);
+    loop {
+        if let Some(pidx) = claim_partition(w, shared, plan, epoch, &mut cursor) {
+            backoff.reset();
+            idle_since = None;
+
+            let started = measure.then(std::time::Instant::now);
+            for &index in &plan.partitions[pidx] {
+                process_node_threaded(
+                    nodes,
+                    plan,
+                    alloc,
+                    boundary,
+                    scope,
+                    index,
+                    epoch,
+                    params_clean,
+                    &mut freeable,
+                );
+            }
+            if let Some(started) = started {
+                // Exponential moving average (1/4 weight); the claiming thread
+                // is the only writer of this partition's cost in this epoch.
+                let sample = started.elapsed().as_nanos() as u64;
+                let cost = &plan.cost_ns[pidx];
+                let old = cost.load(Ordering::Relaxed);
+                cost.store(old - old / 4 + sample / 4, Ordering::Relaxed);
+            }
+
+            for &s in &plan.succs[pidx] {
+                plan.remaining[s].fetch_sub(1, Ordering::AcqRel);
+            }
+            shared.completed.fetch_add(1, Ordering::AcqRel);
+            continue;
         }
 
-        let started = measure.then(std::time::Instant::now);
-        for &index in &plan.partitions[pidx] {
-            process_node_threaded(
-                nodes,
-                plan,
-                alloc,
-                boundary,
-                scope,
-                index,
-                epoch,
-                params_clean,
-                &mut freeable,
-            );
+        if w == 0 {
+            if shared.completed.load(Ordering::Acquire) == n_partitions {
+                break;
+            }
+        } else {
+            if shared.unclaimed.load(Ordering::Relaxed) == 0 {
+                break;
+            }
+            if backoff.yielding() {
+                let since = *idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= WORKER_IDLE {
+                    break;
+                }
+            }
         }
-        if let Some(started) = started {
-            // Exponential moving average (1/4 weight); this worker is the only
-            // writer of this partition's cost in this epoch.
-            let sample = started.elapsed().as_nanos() as u64;
-            let cost = &plan.cost_ns[pidx];
-            let old = cost.load(Ordering::Relaxed);
-            cost.store(old - old / 4 + sample / 4, Ordering::Relaxed);
-        }
-
-        plan.done[pidx].store(epoch, Ordering::Release);
+        backoff.snooze();
     }
 
     freeable
@@ -881,8 +1091,8 @@ fn process_node_threaded(
             node.has_inputs_connected = true;
             for slot in &merge.slots {
                 for &bidx in &slot.sources {
-                    // SAFETY: filled by the producing partition, whose `done` for
-                    // this epoch was observed (Acquire) before this partition
+                    // SAFETY: filled by the producing partition, whose completion
+                    // (its `remaining` decrement) was observed (Acquire) before this partition
                     // started; this index is read-only here.
                     let signal = unsafe { (*boundary.add(bidx)).as_ref() }
                         .filter(|s| s.epoch == epoch)
@@ -915,7 +1125,7 @@ fn process_node_threaded(
     // 3. Copy this node's outputs into the boundary buffers of its cut edges.
     for &(output_index, bidx) in &plan.copy_out[node_idx] {
         // SAFETY: this worker is the sole producer for `bidx` (one cut edge ->
-        // one slot); its consumer reads it only after this partition's `done`.
+        // one slot); its consumer reads it only after this partition completed.
         unsafe {
             node.outputs[output_index].write_boundary(&mut *boundary.add(bidx), epoch);
         }
@@ -960,17 +1170,25 @@ impl Graph {
         let partitioned = false;
 
         // Multicore executor opt-in (native only). `WEB_AUDIO_RS_PARALLEL=1|true`
-        // uses all available cores; an explicit integer sets the worker count.
+        // uses one thread per physical core this process may run on
+        // (`ALL_CORES`); an explicit integer sets the worker count, clamped to
+        // the usable CPUs. Both are re-checked every re-schedule (`cpu_limit`).
         #[cfg(not(target_arch = "wasm32"))]
         let parallel_workers = std::env::var("WEB_AUDIO_RS_PARALLEL").ok().map_or(0, |v| {
             if v == "1" || v == "true" {
-                std::thread::available_parallelism().map_or(1, |n| n.get())
+                ALL_CORES
             } else {
                 v.parse::<usize>().unwrap_or(0)
             }
         });
         #[cfg(target_arch = "wasm32")]
         let parallel_workers = 0;
+        // Read the CPU topology and quota here, off the render thread, for
+        // every parallel setting (the executor clamps explicit counts too).
+        #[cfg(not(target_arch = "wasm32"))]
+        if parallel_workers >= 2 {
+            cpu_limit::prime();
+        }
 
         #[cfg(not(target_arch = "wasm32"))]
         let inline_params =
@@ -1021,6 +1239,10 @@ impl Graph {
             drop_param_resets: tests::DROP_PARAM_RESETS_OVERRIDE.with(std::cell::Cell::get),
             inline_scratch: Vec::new(),
             orphaned_params: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            cpu_limit: 1,
+            #[cfg(not(target_arch = "wasm32"))]
+            cpu_limit_age: 0,
         }
     }
 
@@ -1028,10 +1250,15 @@ impl Graph {
     ///
     /// Takes precedence over the `WEB_AUDIO_RS_PARALLEL` env var read in
     /// [`Graph::new`]. `0` or `1` render serially; `n >= 2` renders across `n`
-    /// threads (byte-identical to serial). No-op in effect on wasm, where the
-    /// parallel executor is not compiled in.
+    /// threads (byte-identical to serial), at most one per usable CPU;
+    /// [`ALL_CORES`] one per usable physical core. No-op in effect on wasm,
+    /// where the parallel executor is not compiled in.
     pub(crate) fn set_parallel_workers(&mut self, workers: usize) {
         self.parallel_workers = workers;
+        #[cfg(not(target_arch = "wasm32"))]
+        if workers >= 2 {
+            cpu_limit::prime();
+        }
     }
 
     /// Whether [`Graph::render_quantum`] renders on the worker pool.
@@ -1827,20 +2054,34 @@ impl Graph {
             .iter()
             .map(|p| std::sync::atomic::AtomicU64::new(1_000 * p.len() as u64))
             .collect();
-        let done = ordered_partitions
+        let remaining = ordered_partitions
+            .iter()
+            .map(|_| std::sync::atomic::AtomicU32::new(0))
+            .collect();
+        let claimed = ordered_partitions
             .iter()
             .map(|_| std::sync::atomic::AtomicU64::new(0))
             .collect();
+        let mut succs: Vec<Vec<usize>> = vec![Vec::new(); ordered_partitions.len()];
+        for (q, ps) in preds.iter().enumerate() {
+            for &p in ps {
+                succs[p].push(q);
+            }
+        }
 
         PartitionPlan {
             partitions: ordered_partitions,
             preds,
             partition_worker: Vec::new(),
             worker_lists: Vec::new(),
+            steal_order: Vec::new(),
+            succs,
+            pinned: Vec::new(),
             assigned_workers: 0,
             quanta_since_schedule: 0,
             cost_ns,
-            done,
+            remaining,
+            claimed,
             is_merge,
             copy_out,
             merge_lookup,
@@ -2130,10 +2371,12 @@ impl Graph {
             .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
             .collect();
 
-        let (partition_worker, worker_lists) =
+        let (partition_worker, worker_lists, steal_order) =
             list_schedule(&costs, &plan.preds, &pinned, n_workers);
         plan.partition_worker = partition_worker;
         plan.worker_lists = worker_lists;
+        plan.steal_order = steal_order;
+        plan.pinned = pinned;
         plan.assigned_workers = n_workers;
         plan.quanta_since_schedule = 0;
     }
@@ -2142,9 +2385,10 @@ impl Graph {
     /// output that is byte-identical to [`Graph::render`].
     ///
     /// Partitions (independent sub-graphs between fan-in points — see
-    /// [`PartitionPlan`]) are statically pinned to worker threads and rendered a
-    /// DAG-level at a time: all partitions in a level run concurrently, then a
-    /// barrier, then the next level. Cross-partition (cut) edges are carried as
+    /// [`PartitionPlan`]) run as soon as their producers completed, on whichever
+    /// thread takes them: each thread prefers its own scheduled list, idle threads
+    /// take any ready partition, and the calling thread stays until all are done.
+    /// Cross-partition (cut) edges are carried as
     /// deep-copied [`BoundarySignal`]s, so partitions never share a buffer
     /// through a cut edge. Merge nodes sum their boundary inputs in the
     /// exact `ordered` fold the serial path uses, so the result bits do not
@@ -2154,7 +2398,25 @@ impl Graph {
         &mut self,
         scope: &AudioWorkletGlobalScope,
     ) -> &AudioRenderQuantum {
-        let n_workers = self.parallel_workers.max(2);
+        // Never more threads than CPUs this process may run on: a worker
+        // without a core of its own only stalls the others. Re-read every
+        // RESCHEDULE_QUANTA quanta, so a changed affinity is followed.
+        if self.cpu_limit_age == 0 {
+            self.cpu_limit = if self.parallel_workers == ALL_CORES {
+                cpu_limit::usable_cores()
+            } else {
+                cpu_limit::usable_cpus()
+            };
+        }
+        self.cpu_limit_age = (self.cpu_limit_age + 1) % RESCHEDULE_QUANTA;
+        let n_workers = self.parallel_workers.min(self.cpu_limit);
+        if n_workers < 2 {
+            // One CPU: render serially (byte-identical). The next threaded
+            // quantum plans afresh, as `render()` may re-order the graph.
+            self.pool = None;
+            self.forget_partition_plan();
+            return self.render(scope);
+        }
 
         if self.ordered.is_empty() {
             self.order_nodes();
@@ -2186,7 +2448,7 @@ impl Graph {
         // Boundary buffers (deep-copied cut-edge signals), persistent across
         // quanta (see `boundary_store`). Accessed from worker threads by raw
         // pointer at disjoint indices; a merge reads a slot only after the
-        // producing partition published `done` for this epoch.
+        // producing partition completed in this epoch.
         if self.boundary_store.len() != plan.boundary_count {
             self.boundary_store.truncate(plan.boundary_count);
             self.boundary_store
@@ -2210,9 +2472,9 @@ impl Graph {
         let shared = &*pool.shared;
 
         // Publish this quantum's task, then start the epoch and wake the workers.
-        // SAFETY: every worker finished the previous epoch (the `finished` wait
-        // below) and reads `task` only after observing the new epoch, which is
-        // stored with Release after this write.
+        // SAFETY: no worker is inside the previous epoch any more (the `active` wait
+        // below) and a worker reads `task` only after joining the new epoch, which is
+        // opened after this write.
         unsafe {
             *shared.task.get() = PoolTask {
                 nodes: &self.nodes,
@@ -2227,11 +2489,15 @@ impl Graph {
             };
         }
         shared
-            .finished
-            .store(0, std::sync::atomic::Ordering::Relaxed);
+            .unclaimed
+            .store(plan.partitions.len(), std::sync::atomic::Ordering::Relaxed);
         shared
-            .epoch
-            .store(epoch, std::sync::atomic::Ordering::Release);
+            .completed
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        for (remaining, preds) in plan.remaining.iter().zip(&plan.preds) {
+            remaining.store(preds.len() as u32, std::sync::atomic::Ordering::Relaxed);
+        }
+        shared.start_epoch(epoch);
         for handle in &pool.handles {
             handle.thread().unpark();
         }
@@ -2244,11 +2510,12 @@ impl Graph {
             node_id: std::cell::Cell::new(AudioNodeId(0)),
             event_sender: scope.event_sender.clone(),
         };
-        // As on the spawned workers: a panic escaping here would leave them
-        // waiting for partitions that never complete, so fail fast.
+        // As on the spawned workers: a panic escaping here would leave the
+        // quantum unfinished, so fail fast.
         let own_freeable = match panic::catch_unwind(AssertUnwindSafe(|| {
-            run_worker_list(
+            run_partitions(
                 0,
+                shared,
                 &self.nodes,
                 &plan,
                 boundary_base,
@@ -2265,17 +2532,15 @@ impl Graph {
             }
         };
 
-        // Wait for the spawned workers; each published its free-list before
-        // incrementing `finished` (Release), so the Acquire load orders both
-        // their slot writes and all their node/boundary accesses before ours.
-        let spawned = n_workers - 1;
-        spin_then_yield(|| shared.finished.load(std::sync::atomic::Ordering::Acquire) == spawned);
+        // Every partition completed. Close the epoch and wait for the workers
+        // still inside it (they only check that nothing is left to take).
+        shared.close_epoch();
         let mut freeables: Vec<Vec<AudioNodeId>> = shared
             .slots
             .iter()
             .map(|s| {
-                // SAFETY: ordered by the `finished` Acquire above; workers no
-                // longer touch their slots until the next epoch.
+                // SAFETY: ordered by the `active` wait above; a worker touches
+                // its slot again only after joining a later epoch.
                 unsafe { std::mem::take(&mut *s.get()) }
             })
             .collect();
@@ -2683,16 +2948,33 @@ mod tests {
         for change in SETTLED_CHANGES {
             let reference = bits(&render_automation_graph(false, false, 0, &[change], false));
             assert_ne!(reference, base, "{change:?} is audible");
-            assert_eq!(
-                bits(&render_automation_graph(true, true, 0, &[change], false)),
-                reference,
-                "{change:?}, params clean"
-            );
-            assert_ne!(
-                bits(&render_automation_graph(true, true, 0, &[change], true)),
-                reference,
-                "{change:?} must fail without its reset"
-            );
+            // Parallel too: the flag is read and set by whichever thread
+            // claims the owner's partition, and reset by the render thread
+            // between quanta.
+            for parallel in [0, 2, 3] {
+                assert_eq!(
+                    bits(&render_automation_graph(
+                        true,
+                        true,
+                        parallel,
+                        &[change],
+                        false
+                    )),
+                    reference,
+                    "{change:?}, params clean, parallel = {parallel}"
+                );
+                assert_ne!(
+                    bits(&render_automation_graph(
+                        true,
+                        true,
+                        parallel,
+                        &[change],
+                        true
+                    )),
+                    reference,
+                    "{change:?} must fail without its reset, parallel = {parallel}"
+                );
+            }
         }
     }
 
@@ -2910,6 +3192,54 @@ mod tests {
             .borrow()
             .inline_params
             .is_empty());
+    }
+
+    /// A worker that sees a new epoch published finds it open: if it could see
+    /// the epoch before it was opened, it would leave, wait for the epoch after,
+    /// and that quantum would run without it. Races the real start / join /
+    /// close; the worker checks `open` right after seeing the epoch, the
+    /// widest window for the race.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_published_epoch_is_already_open() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        const EPOCHS: u64 = 50_000;
+        let shared = std::sync::Arc::new(PoolShared::new(2));
+        let missed = std::sync::Arc::new(AtomicUsize::new(0));
+        let acked = std::sync::Arc::new(AtomicU64::new(0));
+        let worker = {
+            let shared = std::sync::Arc::clone(&shared);
+            let missed = std::sync::Arc::clone(&missed);
+            let acked = std::sync::Arc::clone(&acked);
+            std::thread::spawn(move || {
+                let mut seen = 0;
+                while seen != EPOCHS {
+                    let epoch = loop {
+                        let epoch = shared.epoch.load(Ordering::Acquire);
+                        if epoch != seen {
+                            break epoch;
+                        }
+                        std::hint::spin_loop();
+                    };
+                    seen = epoch;
+                    if shared.try_join(epoch) {
+                        shared.active.fetch_sub(1, Ordering::Release);
+                    } else {
+                        missed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    acked.store(epoch, Ordering::Release);
+                }
+            })
+        };
+        for epoch in 1..=EPOCHS {
+            shared.start_epoch(epoch);
+            while acked.load(Ordering::Acquire) != epoch {
+                std::hint::spin_loop();
+            }
+            shared.close_epoch();
+        }
+        worker.join().unwrap();
+        assert_eq!(missed.load(Ordering::Relaxed), 0, "epochs skipped");
     }
 
     #[derive(Debug, Clone)]
@@ -3543,8 +3873,9 @@ mod tests {
                 .copied()
                 .collect::<std::collections::HashSet<_>>()
                 .len();
+            // The executor never runs more threads than usable CPUs.
             assert!(
-                used_workers >= workers.min(6),
+                used_workers >= workers.min(cpu_limit::usable_cpus()).min(6),
                 "partitions should spread across available workers"
             );
         }
@@ -3923,6 +4254,166 @@ mod tests {
                 "64-worker threaded render (quantum {q}) must be byte-identical to serial"
             );
         }
+        // ... and it runs no more threads than the process may use.
+        assert!(g
+            .pool
+            .as_ref()
+            .is_none_or(|p| p.n_workers <= cpu_limit::usable_cpus()));
+    }
+
+    // Threads that stall at random points (a preempted worker, a slow node) must
+    // neither change the output nor hang the quantum: idle threads take over any
+    // ready partition, a worker gives an idle quantum up, and the render thread
+    // finishes whatever is left. Two levels of fan-in (chains -> buses ->
+    // destination), random stalls per node and quantum, many quanta, compared
+    // bit for bit with the serial render.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn test_threaded_random_stalls_byte_identical() {
+        use std::cell::Cell;
+
+        fn stall(seed: u64) {
+            let mut x = seed.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+            x ^= x >> 29;
+            match x % 16 {
+                0 => std::thread::sleep(std::time::Duration::from_micros(200)),
+                1 => std::thread::yield_now(),
+                2..=3 => {
+                    let until = std::time::Instant::now() + std::time::Duration::from_micros(30);
+                    while std::time::Instant::now() < until {
+                        std::hint::spin_loop();
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct Source {
+            id: u64,
+            value: f32,
+        }
+        impl AudioProcessor for Source {
+            fn process(
+                &mut self,
+                _inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                stall(self.id ^ scope.current_frame.rotate_left(17));
+                let v = self.value * (1.0 + (scope.current_frame / 128) as f32);
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .enumerate()
+                    .for_each(|(i, s)| *s = v + i as f32);
+                true
+            }
+        }
+
+        #[derive(Debug, Clone)]
+        struct Stage {
+            id: u64,
+            k: f32,
+        }
+        impl AudioProcessor for Stage {
+            fn process(
+                &mut self,
+                inputs: &[AudioRenderQuantum],
+                outputs: &mut [AudioRenderQuantum],
+                _params: AudioParamValues<'_>,
+                scope: &AudioWorkletGlobalScope,
+            ) -> bool {
+                stall(self.id ^ scope.current_frame.rotate_left(29));
+                outputs[0] = inputs[0].clone();
+                outputs[0]
+                    .channel_data_mut(0)
+                    .iter_mut()
+                    .for_each(|s| *s *= self.k);
+                true
+            }
+        }
+
+        const BUSES: u64 = 4;
+        const CHAINS_PER_BUS: u64 = 5;
+        fn build() -> Graph {
+            let mut g = Graph::new(llq::Queue::new().split().0);
+            add_node(&mut g, 0, Box::new(Stage { id: 0, k: 1.0 })); // destination
+            add_node(&mut g, 1, Box::new(TestNode { tail_time: true })); // listener
+            let mut id = 2;
+            for b in 0..BUSES {
+                let bus = id;
+                id += 1;
+                add_node(
+                    &mut g,
+                    bus,
+                    Box::new(Stage {
+                        id: bus,
+                        k: 0.5 + b as f32,
+                    }),
+                );
+                add_edge(&mut g, bus, 0);
+                for c in 0..CHAINS_PER_BUS {
+                    let src = id;
+                    let fx = id + 1;
+                    id += 2;
+                    // Order-sensitive magnitudes make the fold order visible.
+                    let value = if c % 2 == 0 { 1e20 } else { -1e20 } * (c + 1) as f32 + b as f32;
+                    add_node(&mut g, src, Box::new(Source { id: src, value }));
+                    add_node(
+                        &mut g,
+                        fx,
+                        Box::new(Stage {
+                            id: fx,
+                            k: 1.0 + c as f32 * 0.25,
+                        }),
+                    );
+                    add_edge(&mut g, src, fx);
+                    add_edge(&mut g, fx, bus);
+                }
+            }
+            g
+        }
+
+        const QUANTA: u64 = 150;
+        let scope_at = |q: u64| AudioWorkletGlobalScope {
+            current_frame: q * 128,
+            current_time: (q * 128) as f64 / 48000.,
+            sample_rate: 48000.,
+            node_id: Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+        let serial: Vec<Vec<u32>> = {
+            let mut g = build();
+            (0..QUANTA)
+                .map(|q| {
+                    let bits = g
+                        .render(&scope_at(q))
+                        .channel_data(0)
+                        .iter()
+                        .map(|x| x.to_bits());
+                    bits.collect()
+                })
+                .collect()
+        };
+
+        for workers in [2usize, 3, 8, 32] {
+            let mut g = build();
+            g.parallel_workers = workers;
+            for (q, expected) in serial.iter().enumerate() {
+                let got: Vec<u32> = g
+                    .render_partitioned_threaded(&scope_at(q as u64))
+                    .channel_data(0)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert_eq!(
+                    &got, expected,
+                    "threaded render with stalls (workers={workers}, quantum={q}) must be byte-identical to serial"
+                );
+            }
+        }
     }
 
     // Breaking a feedback cycle clears the DelayNode writer's edge to its reader,
@@ -4176,14 +4667,16 @@ mod tests {
         );
         let threads = line.threads.lock().unwrap();
         assert_eq!(threads.len(), 16, "both halves render every quantum");
+        // Within each quantum both halves run on one thread (their partition);
+        // that partition may run on another thread in a later quantum.
         assert!(
-            threads.iter().all(|&(_, t)| t == threads[0].1),
-            "delay writer and reader must stay on one thread: {threads:?}"
+            threads.chunks(2).all(|q| q[0].1 == q[1].1),
+            "delay writer and reader must share a thread within a quantum: {threads:?}"
         );
     }
 
-    // The executor runs each worker's list in order and waits for producers by
-    // their `done` marks, so the schedule itself must guarantee: every partition
+    // The schedule gives each worker its preferred list (the executor also lets
+    // idle threads take any ready partition), and it must guarantee: every partition
     // exactly once, pinned partitions on worker 0, and no possible deadlock.
     // Checked on random DAGs by executing the lists with those waits.
     #[cfg(not(target_arch = "wasm32"))]
@@ -4215,7 +4708,17 @@ mod tests {
             let pinned: Vec<bool> = (0..n).map(|_| rand(10) == 0).collect();
             let workers = 1 + rand(8) as usize;
 
-            let (partition_worker, lists) = list_schedule(&costs, &preds, &pinned, workers);
+            let (partition_worker, lists, order) = list_schedule(&costs, &preds, &pinned, workers);
+            assert_eq!(order.len(), n, "case {case}");
+            let mut pos = vec![0usize; n];
+            for (i, &q) in order.iter().enumerate() {
+                pos[q] = i;
+            }
+            for (q, ps) in preds.iter().enumerate() {
+                for &p in ps {
+                    assert!(pos[p] < pos[q], "case {case}: order not topological");
+                }
+            }
 
             assert_eq!(lists.len(), workers, "case {case}");
             let mut seen = vec![false; n];
