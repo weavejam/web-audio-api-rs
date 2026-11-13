@@ -4813,9 +4813,11 @@ mod tests {
         );
         let threads = line.threads.lock().unwrap();
         assert_eq!(threads.len(), 16, "both halves render every quantum");
+        // Within each quantum both halves run on one thread (their partition);
+        // that partition may run on another thread in a later quantum.
         assert!(
-            threads.iter().all(|&(_, t)| t == threads[0].1),
-            "delay writer and reader must stay on one thread: {threads:?}"
+            threads.chunks(2).all(|q| q[0].1 == q[1].1),
+            "delay writer and reader must share a thread within a quantum: {threads:?}"
         );
     }
 
