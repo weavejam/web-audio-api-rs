@@ -77,6 +77,18 @@ pub struct Node {
     /// `process`, instead of as separate entries of the render order (see
     /// [`Graph::assign_inline_params`]). Recomputed on every re-ordering.
     inline_params: SmallVec<[AudioNodeId; 4]>,
+    /// Every param in `inline_params` is settled: its last quantum started
+    /// idle (empty timeline, silent input) and armed its idle fast path, so
+    /// evaluating it again would only re-store the same `[[current value]]`
+    /// and leave its output buffer as it is. While this holds, the owner skips
+    /// its inline params altogether (one check per quantum instead of a borrow
+    /// and a virtual `process` per param). Cleared whenever anything can
+    /// change what one of them computes: a message routed to it (event,
+    /// automation rate), a channel-config change, and every re-plan.
+    params_clean: bool,
+    /// For an inline param: the owner whose `inline_params` holds it, so a
+    /// message to the param can clear the owner's `params_clean`.
+    inline_owner: Option<AudioNodeId>,
 }
 
 /// Evaluate the AudioParams that `owner` reads, inline (see
@@ -91,16 +103,20 @@ pub struct Node {
 /// down with it (the error is reported with the param's id). The owner would
 /// fail on its next read of the vanished param anyway; this way the param is
 /// handed back to the render order when its owner is freed and freed there.
+///
+/// Returns whether every param is now settled (see [`Node::params_clean`]).
 #[inline]
 fn process_inline_params(
     nodes: &NodeCollection,
     inline_params: &[AudioNodeId],
     scope: &AudioWorkletGlobalScope,
-) {
+) -> bool {
+    let mut settled = true;
     for &id in inline_params {
         let mut param = nodes.get_unchecked(id).borrow_mut();
         scope.node_id.set(id);
         param.process(AudioParamValues::from(nodes), scope);
+        settled &= param.processor.param_settled();
         // An inline param has no incoming edge, but its input can still hold
         // residue summed in while it was an ordinary node that was not
         // rendered (muted in a cycle that is then broken). The render loop
@@ -114,6 +130,25 @@ fn process_inline_params(
             param.has_inputs_connected = false;
         }
     }
+    settled
+}
+
+/// Evaluate `node`'s inline params unless they are all settled (see
+/// [`Node::params_clean`]); restores `scope.node_id` to the owner after.
+#[inline]
+fn run_inline_params(
+    nodes: &NodeCollection,
+    node: &mut Node,
+    index: AudioNodeId,
+    params_clean_enabled: bool,
+    scope: &AudioWorkletGlobalScope,
+) {
+    if node.params_clean || node.inline_params.is_empty() {
+        return;
+    }
+    let settled = process_inline_params(nodes, &node.inline_params, scope);
+    node.params_clean = settled && params_clean_enabled;
+    scope.node_id.set(index);
 }
 
 impl std::fmt::Debug for Node {
@@ -230,6 +265,15 @@ pub(crate) struct Graph {
     /// builds can turn it off with `WEB_AUDIO_RS_INLINE_PARAMS=0` for A/B runs).
     /// Output is byte-identical either way.
     inline_params: bool,
+    /// Skip the inline params of an owner while they are all settled (see
+    /// [`Node::params_clean`]; default on; native builds can turn it off with
+    /// `WEB_AUDIO_RS_PARAMS_CLEAN=0` for A/B runs). Output is byte-identical
+    /// either way.
+    params_clean: bool,
+    /// Test-only: [`Graph::mark_params_dirty`] does nothing, so tests can show
+    /// that each params-clean regression case fails without its reset.
+    #[cfg(test)]
+    drop_param_resets: bool,
     /// Scratch for [`Graph::assign_inline_params`], indexed by `AudioNodeId.0`.
     inline_scratch: Vec<u8>,
     /// Inline params whose owner was freed this quantum; they rejoin `ordered`
@@ -477,6 +521,8 @@ struct PoolTask {
     epoch: u64,
     /// Whether to time the partitions this quantum (cost sampling).
     measure: bool,
+    /// [`Graph::params_clean`].
+    params_clean: bool,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -490,6 +536,7 @@ impl PoolTask {
         sample_rate: 0.0,
         epoch: 0,
         measure: false,
+        params_clean: false,
     };
 }
 
@@ -732,6 +779,7 @@ fn worker_render_loop(
                 &scope,
                 task.epoch,
                 task.measure,
+                task.params_clean,
             );
             // SAFETY: only worker `w` writes `slots[w - 1]`; the main thread
             // reads it after the `finished` increment below.
@@ -754,6 +802,7 @@ fn worker_render_loop(
 /// epoch, then runs its nodes in serial order and publishes its own `done`.
 /// Returns the end-of-life node ids it recorded.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn run_worker_list(
     w: usize,
     nodes: &NodeCollection,
@@ -762,6 +811,7 @@ fn run_worker_list(
     scope: &AudioWorkletGlobalScope,
     epoch: u64,
     measure: bool,
+    params_clean: bool,
 ) -> Vec<AudioNodeId> {
     use std::sync::atomic::Ordering;
     let alloc = &Alloc;
@@ -783,6 +833,7 @@ fn run_worker_list(
                 scope,
                 index,
                 epoch,
+                params_clean,
                 &mut freeable,
             );
         }
@@ -815,6 +866,7 @@ fn process_node_threaded(
     scope: &AudioWorkletGlobalScope,
     index: AudioNodeId,
     epoch: u64,
+    params_clean: bool,
     freeable: &mut Vec<AudioNodeId>,
 ) {
     let node_idx = index.0 as usize;
@@ -847,10 +899,7 @@ fn process_node_threaded(
     scope.node_id.set(index);
     let (success, tail_time) = {
         let catch_me = AssertUnwindSafe(|| {
-            if !node.inline_params.is_empty() {
-                process_inline_params(nodes, &node.inline_params, scope);
-                scope.node_id.set(index);
-            }
+            run_inline_params(nodes, &mut node, index, params_clean, scope);
             node.process(params, scope)
         });
         match panic::catch_unwind(catch_me) {
@@ -932,6 +981,15 @@ impl Graph {
         let inline_params = tests::INLINE_PARAMS_OVERRIDE
             .with(std::cell::Cell::get)
             .unwrap_or(inline_params);
+        #[cfg(not(target_arch = "wasm32"))]
+        let params_clean =
+            !std::env::var("WEB_AUDIO_RS_PARAMS_CLEAN").is_ok_and(|v| v == "0" || v == "false");
+        #[cfg(target_arch = "wasm32")]
+        let params_clean = true;
+        #[cfg(test)]
+        let params_clean = tests::PARAMS_CLEAN_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(params_clean);
         #[cfg(test)]
         let parallel_workers = tests::PARALLEL_OVERRIDE
             .with(std::cell::Cell::get)
@@ -958,6 +1016,9 @@ impl Graph {
             #[cfg(not(target_arch = "wasm32"))]
             partition_cost_memory: std::collections::HashMap::new(),
             inline_params,
+            params_clean,
+            #[cfg(test)]
+            drop_param_resets: tests::DROP_PARAM_RESETS_OVERRIDE.with(std::cell::Cell::get),
             inline_scratch: Vec::new(),
             orphaned_params: Vec::new(),
         }
@@ -1089,6 +1150,8 @@ impl Graph {
                 cycle_break_partners: smallvec![],
                 is_audio_param,
                 inline_params: smallvec![],
+                params_clean: false,
+                inline_owner: None,
             }),
         );
 
@@ -1145,22 +1208,38 @@ impl Graph {
 
     pub fn set_channel_count(&mut self, index: AudioNodeId, v: usize) {
         self.nodes.get_unchecked_mut(index).channel_config.count = v;
+        self.mark_params_dirty(index);
     }
     pub fn set_channel_count_mode(&mut self, index: AudioNodeId, v: ChannelCountMode) {
         self.nodes
             .get_unchecked_mut(index)
             .channel_config
             .count_mode = v;
+        self.mark_params_dirty(index);
     }
     pub fn set_channel_interpretation(&mut self, index: AudioNodeId, v: ChannelInterpretation) {
         self.nodes
             .get_unchecked_mut(index)
             .channel_config
             .interpretation = v;
+        self.mark_params_dirty(index);
     }
 
     pub fn route_message(&mut self, index: AudioNodeId, msg: &mut dyn Any) {
         self.nodes.get_unchecked_mut(index).processor.onmessage(msg);
+        self.mark_params_dirty(index);
+    }
+
+    /// Something may have changed what node `index` computes: if it is a param
+    /// evaluated inline, its owner must evaluate its params again.
+    fn mark_params_dirty(&mut self, index: AudioNodeId) {
+        #[cfg(test)]
+        if self.drop_param_resets {
+            return;
+        }
+        if let Some(owner) = self.nodes.get_unchecked_mut(index).inline_owner {
+            self.nodes.get_unchecked_mut(owner).params_clean = false;
+        }
     }
 
     /// Helper function for `order_nodes` - traverse node and outgoing edges
@@ -1346,7 +1425,10 @@ impl Graph {
     /// on a quantum boundary and sample-exact.
     fn assign_inline_params(&mut self) {
         for node in self.nodes.values_mut() {
-            node.get_mut().inline_params.clear();
+            let node = node.get_mut();
+            node.inline_params.clear();
+            node.params_clean = false;
+            node.inline_owner = None;
         }
         if !self.inline_params {
             return;
@@ -1395,6 +1477,7 @@ impl Graph {
                 .borrow_mut()
                 .inline_params
                 .push(id);
+            nodes.get_unchecked(id).borrow_mut().inline_owner = Some(owner);
             false
         });
     }
@@ -1405,6 +1488,9 @@ impl Graph {
     /// are freed as usual once their control handle is gone.
     fn rehome_orphaned_params(&mut self) {
         if !self.orphaned_params.is_empty() {
+            for &id in &self.orphaned_params {
+                self.nodes.get_unchecked_mut(id).inline_owner = None;
+            }
             self.ordered.append(&mut self.orphaned_params);
             self.forget_partition_plan();
         }
@@ -1453,10 +1539,7 @@ impl Graph {
                 // This may lead to logic bugs later on, but it is the best that we can do.
                 // The alternative is to crash and reboot the render thread.
                 let catch_me = AssertUnwindSafe(|| {
-                    if !node.inline_params.is_empty() {
-                        process_inline_params(&self.nodes, &node.inline_params, scope);
-                        scope.node_id.set(*index);
-                    }
+                    run_inline_params(&self.nodes, &mut node, *index, self.params_clean, scope);
                     node.process(params, scope)
                 });
 
@@ -1928,10 +2011,7 @@ impl Graph {
                 scope.node_id.set(index);
                 let (success, tail_time) = {
                     let catch_me = AssertUnwindSafe(|| {
-                        if !node.inline_params.is_empty() {
-                            process_inline_params(&self.nodes, &node.inline_params, scope);
-                            scope.node_id.set(index);
-                        }
+                        run_inline_params(&self.nodes, &mut node, index, self.params_clean, scope);
                         node.process(params, scope)
                     });
                     match panic::catch_unwind(catch_me) {
@@ -2143,6 +2223,7 @@ impl Graph {
                 sample_rate: scope.sample_rate,
                 epoch,
                 measure,
+                params_clean: self.params_clean,
             };
         }
         shared
@@ -2174,6 +2255,7 @@ impl Graph {
                 &scope0,
                 epoch,
                 measure,
+                self.params_clean,
             )
         })) {
             Ok(freeable) => freeable,
@@ -2305,17 +2387,31 @@ mod tests {
         /// calling thread), so A/B tests need no process-wide env var.
         pub(super) static INLINE_PARAMS_OVERRIDE: std::cell::Cell<Option<bool>> =
             const { std::cell::Cell::new(None) };
+        /// Test-only override of the params-clean switch, as above.
+        pub(super) static PARAMS_CLEAN_OVERRIDE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
         /// Test-only override of the worker count, as above.
         pub(super) static PARALLEL_OVERRIDE: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+        /// Test-only: graphs built on this thread drop the resets of
+        /// `mark_params_dirty` (see `Graph::drop_param_resets`).
+        pub(super) static DROP_PARAM_RESETS_OVERRIDE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     /// Render an automation-heavy offline graph with params inline or as graph
     /// nodes: every automation kind, k-rate and a-rate, a param that gets an
     /// audio input connected and later disconnected mid-render, a param
     /// connected from the start, and an owner that ends (stop + dropped handle)
-    /// while its params are inline.
-    fn render_automation_graph(inline: bool, parallel: usize) -> Vec<Vec<f32>> {
+    /// while its params are inline. `changes` are applied from the control
+    /// side to params that have been settled (idle) for many quanta.
+    fn render_automation_graph(
+        inline: bool,
+        clean: bool,
+        parallel: usize,
+        changes: &[SettledChange],
+        drop_resets: bool,
+    ) -> Vec<Vec<f32>> {
         use crate::context::BaseAudioContext;
         use crate::context::OfflineAudioContext;
         use crate::node::{AudioNode, AudioScheduledSourceNode};
@@ -2323,13 +2419,17 @@ mod tests {
         use std::sync::{Arc, Mutex};
 
         INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+        PARAMS_CLEAN_OVERRIDE.with(|o| o.set(Some(clean)));
         PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+        DROP_PARAM_RESETS_OVERRIDE.with(|o| o.set(drop_resets));
         let sr = 48000.;
         use crate::RENDER_QUANTUM_SIZE;
         let q = RENDER_QUANTUM_SIZE as f64 / sr as f64;
-        let mut ctx = OfflineAudioContext::new(2, RENDER_QUANTUM_SIZE * 60, sr);
+        let mut ctx = OfflineAudioContext::new(2, RENDER_QUANTUM_SIZE * 120, sr);
         INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+        PARAMS_CLEAN_OVERRIDE.with(|o| o.set(None));
         PARALLEL_OVERRIDE.with(|o| o.set(None));
+        DROP_PARAM_RESETS_OVERRIDE.with(|o| o.set(false));
 
         let mut osc = ctx.create_oscillator();
         osc.set_type(crate::node::OscillatorType::Sawtooth);
@@ -2406,6 +2506,72 @@ mod tests {
             });
         }
 
+        {
+            // the LFO modulates again, so its frequency is audible
+            let (amp, lfo_gain) = (Arc::clone(&amp), Arc::clone(&lfo_gain));
+            ctx.suspend_sync(53. * q, move |_| {
+                let amp = amp.lock().unwrap();
+                lfo_gain.lock().unwrap().connect(amp.gain());
+            });
+        }
+
+        let pan = Arc::new(Mutex::new(pan));
+        let filter = Arc::new(Mutex::new(filter));
+        let lfo = Arc::new(Mutex::new(lfo));
+        {
+            // A rate change cannot change what a settled param outputs (its
+            // timeline is empty); it changes how the ramp below is sampled.
+            // test_params_clean_skips_settled_params checks its reset directly.
+            let pan = Arc::clone(&pan);
+            ctx.suspend_sync(44. * q, move |_| {
+                pan.lock()
+                    .unwrap()
+                    .pan()
+                    .set_automation_rate(AutomationRate::K);
+            });
+        }
+
+        // Params idle (settled) for many quanta, then changed from the control
+        // side: their owner must evaluate them again from the next quantum.
+        // Each change is the only one its owner gets at that time, and each is
+        // audible (test_params_clean_resets_are_audible).
+        for &change in changes {
+            match change {
+                SettledChange::PanValue => {
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(40. * q, move |_| {
+                        pan.lock().unwrap().pan().set_value(0.4);
+                    });
+                }
+                SettledChange::PanFutureEvent => {
+                    // scheduled while the param is settled, due 6.5 quanta later
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(45. * q, move |_| {
+                        pan.lock().unwrap().pan().set_value_at_time(0.1, 51.5 * q);
+                    });
+                }
+                SettledChange::FilterFrequency => {
+                    let filter = Arc::clone(&filter);
+                    ctx.suspend_sync(46. * q, move |_| {
+                        filter.lock().unwrap().frequency().set_value(1800.);
+                    });
+                }
+                SettledChange::LfoFrequency => {
+                    let lfo = Arc::clone(&lfo);
+                    ctx.suspend_sync(56. * q, move |_| {
+                        lfo.lock().unwrap().frequency().set_value(3.);
+                    });
+                }
+                SettledChange::PanRamp => {
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(60. * q, move |_| {
+                        let pan = pan.lock().unwrap();
+                        pan.pan().linear_ramp_to_value_at_time(-0.8, 66.2 * q);
+                    });
+                }
+            }
+        }
+
         let out = ctx.start_rendering_sync();
         (0..2).map(|c| out.get_channel_data(c).to_vec()).collect()
     }
@@ -2469,17 +2635,189 @@ mod tests {
         }
     }
 
+    /// A control-side change to a param that has been settled for many quanta
+    /// (see [`render_automation_graph`]).
+    #[derive(Clone, Copy, Debug)]
+    enum SettledChange {
+        /// `set_value` on the stereo panner's pan.
+        PanValue,
+        /// A `set_value_at_time` on the pan that is due 6.5 quanta after it
+        /// arrives: the param is not settled while it waits.
+        PanFutureEvent,
+        /// `set_value` on the low-pass filter's frequency.
+        FilterFrequency,
+        /// `set_value` on the frequency of an LFO that modulates the gain again
+        /// (reconnected 3 quanta earlier).
+        LfoFrequency,
+        /// A ramp on the (k-rate by then) pan.
+        PanRamp,
+    }
+
+    const SETTLED_CHANGES: [SettledChange; 5] = [
+        SettledChange::PanValue,
+        SettledChange::PanFutureEvent,
+        SettledChange::FilterFrequency,
+        SettledChange::LfoFrequency,
+        SettledChange::PanRamp,
+    ];
+
+    fn bits(channels: &[Vec<f32>]) -> Vec<Vec<u32>> {
+        channels
+            .iter()
+            .map(|c| c.iter().map(|s| s.to_bits()).collect())
+            .collect()
+    }
+
+    /// Each settled-param change is audible and needs its reset: with params
+    /// clean the render matches the reference, and with the resets of
+    /// `mark_params_dirty` dropped it does not (while the graph without the
+    /// change still does, so the difference is that change's alone).
+    #[test]
+    fn test_params_clean_resets_are_audible() {
+        let base = bits(&render_automation_graph(false, false, 0, &[], false));
+        assert_eq!(
+            bits(&render_automation_graph(true, true, 0, &[], true)),
+            base,
+            "no change, resets dropped"
+        );
+        for change in SETTLED_CHANGES {
+            let reference = bits(&render_automation_graph(false, false, 0, &[change], false));
+            assert_ne!(reference, base, "{change:?} is audible");
+            assert_eq!(
+                bits(&render_automation_graph(true, true, 0, &[change], false)),
+                reference,
+                "{change:?}, params clean"
+            );
+            assert_ne!(
+                bits(&render_automation_graph(true, true, 0, &[change], true)),
+                reference,
+                "{change:?} must fail without its reset"
+            );
+        }
+    }
+
     #[test]
     fn test_inline_params_byte_identical() {
-        let reference = render_automation_graph(false, 0);
+        let reference = render_automation_graph(false, false, 0, &SETTLED_CHANGES, false);
         assert!(reference[0].iter().any(|s| *s != 0.));
         for parallel in [0, 2, 3] {
-            let inlined = render_automation_graph(true, parallel);
-            for (a, b) in reference.iter().zip(&inlined) {
-                let a: Vec<u32> = a.iter().map(|s| s.to_bits()).collect();
-                let b: Vec<u32> = b.iter().map(|s| s.to_bits()).collect();
-                assert_eq!(a, b, "parallel = {parallel}");
+            for (inline, clean) in [(false, true), (true, false), (true, true)] {
+                let rendered =
+                    render_automation_graph(inline, clean, parallel, &SETTLED_CHANGES, false);
+                for (a, b) in reference.iter().zip(&rendered) {
+                    let a: Vec<u32> = a.iter().map(|s| s.to_bits()).collect();
+                    let b: Vec<u32> = b.iter().map(|s| s.to_bits()).collect();
+                    assert_eq!(
+                        a, b,
+                        "inline = {inline}, clean = {clean}, parallel = {parallel}"
+                    );
+                }
             }
+        }
+    }
+
+    /// A param processor that counts its `process` calls and reports itself
+    /// settled, as an idle `AudioParamProcessor` does.
+    #[derive(Debug)]
+    struct CountingParam(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl AudioProcessor for CountingParam {
+        fn process(
+            &mut self,
+            _inputs: &[AudioRenderQuantum],
+            _outputs: &mut [AudioRenderQuantum],
+            _params: AudioParamValues<'_>,
+            _scope: &AudioWorkletGlobalScope,
+        ) -> bool {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            true
+        }
+
+        fn onmessage(&mut self, _msg: &mut dyn Any) {}
+
+        fn param_settled(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn test_params_clean_skips_settled_params() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for clean in [true, false] {
+            INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(true)));
+            PARAMS_CLEAN_OVERRIDE.with(|o| o.set(Some(clean)));
+            let mut graph = Graph::new(llq::Queue::new().split().0);
+            INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+            PARAMS_CLEAN_OVERRIDE.with(|o| o.set(None));
+
+            let node = Box::new(TestNode { tail_time: true });
+            add_node(&mut graph, 0, node.clone());
+            add_node(&mut graph, 1, node.clone());
+            add_node(&mut graph, 2, node.clone());
+            add_edge(&mut graph, 2, 0);
+            let calls = std::sync::Arc::new(AtomicUsize::new(0));
+            add_node(
+                &mut graph,
+                3,
+                Box::new(CountingParam(std::sync::Arc::clone(&calls))),
+            );
+            graph.nodes.get_unchecked_mut(AudioNodeId(3)).is_audio_param = true;
+            add_audioparam(&mut graph, 3, 2);
+
+            let scope = AudioWorkletGlobalScope {
+                current_frame: 0,
+                current_time: 0.,
+                sample_rate: 48000.,
+                node_id: std::cell::Cell::new(AudioNodeId(0)),
+                event_sender: crossbeam_channel::unbounded().0,
+            };
+            let mut expect = 0;
+            let mut step = |graph: &mut Graph, evaluated: bool, why: &str| {
+                graph.render(&scope);
+                expect += usize::from(evaluated || !clean);
+                let got = calls.load(Ordering::Relaxed);
+                assert_eq!(got, expect, "{why}, clean = {clean}");
+            };
+
+            step(&mut graph, true, "first quantum");
+            assert!(!graph.ordered.contains(&AudioNodeId(3)), "param is inline");
+            step(&mut graph, false, "settled");
+            step(&mut graph, false, "still settled");
+            graph.route_message(AudioNodeId(3), &mut ());
+            step(&mut graph, true, "message to the param");
+            step(&mut graph, false, "settled again");
+            // an automation-rate change cannot change a settled param's output,
+            // so check its reset directly
+            let owner_clean = |graph: &Graph| {
+                graph
+                    .nodes
+                    .get_unchecked(AudioNodeId(2))
+                    .borrow()
+                    .params_clean
+            };
+            assert_eq!(owner_clean(&graph), clean);
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::K);
+            assert!(!owner_clean(&graph), "rate message clears params_clean");
+            step(&mut graph, true, "automation rate of the param");
+            assert_eq!(owner_clean(&graph), clean);
+            graph.drop_param_resets = true;
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::A);
+            assert_eq!(owner_clean(&graph), clean, "flag kept without the reset");
+            graph.drop_param_resets = false;
+            step(&mut graph, false, "skipped without the reset");
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::A);
+            step(&mut graph, true, "automation rate of the param, again");
+            graph.route_message(AudioNodeId(2), &mut ());
+            step(
+                &mut graph,
+                false,
+                "a message to the owner leaves its params",
+            );
+            graph.set_channel_count(AudioNodeId(3), 1);
+            step(&mut graph, true, "channel config of the param");
+            add_edge(&mut graph, 1, 0); // re-plan
+            step(&mut graph, true, "re-plan");
+            step(&mut graph, false, "settled after the re-plan");
         }
     }
 

@@ -192,6 +192,14 @@ pub trait AudioProcessor: Send {
     }
 
     fn before_drop(&mut self, _scope: &AudioWorkletGlobalScope) {}
+
+    /// Internal (AudioParam processors only): after `process`, whether
+    /// processing the next quantum would change nothing as long as no message
+    /// reaches this processor. The render graph then skips it.
+    #[doc(hidden)]
+    fn param_settled(&self) -> bool {
+        false
+    }
 }
 
 /// Scheduling constraint a processor places on the multicore render executor.
