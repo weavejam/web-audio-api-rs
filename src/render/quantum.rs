@@ -605,6 +605,29 @@ impl AudioRenderQuantum {
             return;
         }
 
+        // Fast path: `self` is silent and mixing it would only add silent
+        // channels (no down-mix, which would compute zeros into a buffer). Then
+        // every channel sum below is `silent.add(o)`, which is `o.clone()`: the
+        // general path yields exactly `other` mixed to `new_channels`, no
+        // arithmetic involved (so -0.0 and NaN payloads are kept as they are).
+        // This is the common case: the first push into an input each quantum.
+        if channels_self <= new_channels && self.is_silent() {
+            self.channels.clear();
+            self.channels.extend(other.channels.iter().cloned());
+            self.mix(new_channels, interpretation);
+            return;
+        }
+
+        // Fast path: `other` is silent and mixing it would only add silent
+        // channels, so every `s.add(o)` below is a no-op (a silent `s` stays
+        // silent, a non-silent one is left untouched). A down-mix of `other`
+        // would compute zeros into a real buffer and then add +0.0 (turning
+        // -0.0 into +0.0), so that case takes the general path.
+        if channels_other <= new_channels && other.is_silent() {
+            self.mix(new_channels, interpretation);
+            return;
+        }
+
         self.mix(new_channels, interpretation);
 
         let mut other_mixed = other.clone();
@@ -899,6 +922,169 @@ mod tests {
         // test add two signals
         signal1.add(&signal2);
         assert_float_eq!(&signal1[..], &[3.; RENDER_QUANTUM_SIZE][..], abs_all <= 0.);
+    }
+
+    /// `add` before its silent-input fast paths, verbatim.
+    fn add_reference(
+        this: &mut AudioRenderQuantum,
+        other: &AudioRenderQuantum,
+        channel_config: &ChannelConfigInner,
+    ) {
+        let channels_self = this.number_of_channels();
+        let channels_other = other.number_of_channels();
+        let max_channels = channels_self.max(channels_other);
+        let interpretation = channel_config.interpretation;
+        let mode = channel_config.count_mode;
+        let count = channel_config.count;
+        let new_channels = match mode {
+            ChannelCountMode::Max => max_channels,
+            ChannelCountMode::Explicit => count,
+            ChannelCountMode::ClampedMax => max_channels.min(count),
+        };
+        if interpretation == ChannelInterpretation::Speakers
+            && new_channels <= 2
+            && this.all_channels_identical()
+            && other.all_channels_identical()
+        {
+            this.channels.truncate(1);
+            this.channels[0].add(&other.channels[0]);
+            this.mix(new_channels, interpretation);
+            return;
+        }
+        this.mix(new_channels, interpretation);
+        let mut other_mixed = other.clone();
+        other_mixed.mix(new_channels, interpretation);
+        this.channels
+            .iter_mut()
+            .zip(other_mixed.channels.iter())
+            .for_each(|(s, o)| s.add(o));
+    }
+
+    /// Quanta covering every shape `add` distinguishes: silent (one or more
+    /// channels), distinct buffers, one aliased buffer, and silent and
+    /// non-silent channels mixed; samples include -0.0, NaN payloads, inf.
+    fn add_test_quanta(alloc: &Alloc, seed: u32) -> Vec<AudioRenderQuantum> {
+        let block = |k: u32| {
+            let mut c = alloc.silence();
+            c.iter_mut().enumerate().for_each(|(i, v)| {
+                let i = i as u32;
+                *v = match (i + k) % 7 {
+                    0 => -0.0,
+                    1 => f32::from_bits(0x7fc0_1234 + k),
+                    2 => f32::from_bits(0xffc0_0042),
+                    3 => f32::INFINITY,
+                    4 => f32::from_bits(1 + i),
+                    5 => -1.5 * (k + 1) as f32,
+                    _ => 0.25 + i as f32,
+                };
+            });
+            c
+        };
+        let mut out = vec![];
+        for n in [1, 2, 3, 4, 5, 6, 8] {
+            let mut silent = AudioRenderQuantum::from(alloc.silence());
+            silent.set_number_of_channels(n);
+            out.push(silent);
+            let mut aliased = AudioRenderQuantum::from(block(seed));
+            aliased.set_number_of_channels(n);
+            out.push(aliased);
+            let mut distinct = AudioRenderQuantum::from(block(seed));
+            let mut gappy = AudioRenderQuantum::from(alloc.silence());
+            for c in 1..n {
+                distinct.channels.push(block(seed + c as u32));
+                gappy.channels.push(if c % 2 == 1 {
+                    block(seed + 10 + c as u32)
+                } else {
+                    alloc.silence()
+                });
+            }
+            out.push(distinct);
+            if n > 1 {
+                out.push(gappy);
+            }
+        }
+        out
+    }
+
+    /// Everything about a quantum that later processing can observe: channel
+    /// count, per channel the sample bits and silence, which channels share a
+    /// buffer, and which share one with the given inputs.
+    fn add_observable(
+        q: &AudioRenderQuantum,
+        inputs: &[&AudioRenderQuantum],
+    ) -> Vec<(bool, Vec<u32>, Vec<bool>, Vec<bool>)> {
+        q.channels
+            .iter()
+            .map(|c| {
+                let shared_inputs = inputs
+                    .iter()
+                    .flat_map(|i| i.channels.iter())
+                    .map(|i| !c.is_silent() && i.data_ptr() == c.data_ptr())
+                    .collect();
+                let aliases = q
+                    .channels
+                    .iter()
+                    .map(|d| d.data_ptr() == c.data_ptr())
+                    .collect();
+                (
+                    c.is_silent(),
+                    c.iter().map(|v| v.to_bits()).collect(),
+                    aliases,
+                    shared_inputs,
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_add_fast_paths_match_general_path() {
+        use crate::node::{ChannelConfigInner, ChannelCountMode, ChannelInterpretation};
+
+        let alloc = Alloc::with_capacity(8);
+        let selves = add_test_quanta(&alloc, 0);
+        let others = add_test_quanta(&alloc, 3);
+        let mut cases = 0;
+        for interpretation in [
+            ChannelInterpretation::Speakers,
+            ChannelInterpretation::Discrete,
+        ] {
+            for count_mode in [
+                ChannelCountMode::Max,
+                ChannelCountMode::Explicit,
+                ChannelCountMode::ClampedMax,
+            ] {
+                for count in [1, 2, 3, 4, 5, 6, 8] {
+                    let config = ChannelConfigInner {
+                        count,
+                        count_mode,
+                        interpretation,
+                    };
+                    for this in &selves {
+                        for other in &others {
+                            for single_valued in [false, true] {
+                                let mut a = this.clone();
+                                a.set_single_valued(single_valued);
+                                let mut b = a.clone();
+                                add_reference(&mut a, other, &config);
+                                b.add(other, &config);
+                                assert_eq!(a.single_valued(), b.single_valued());
+                                assert_eq!(
+                                    add_observable(&a, &[this, other]),
+                                    add_observable(&b, &[this, other]),
+                                    "{config:?} self {} ch silent={} other {} ch silent={}",
+                                    this.number_of_channels(),
+                                    this.is_silent(),
+                                    other.number_of_channels(),
+                                    other.is_silent(),
+                                );
+                                cases += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(cases > 10_000);
     }
 
     #[test]

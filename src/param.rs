@@ -759,6 +759,15 @@ impl AudioProcessor for AudioParamProcessor {
 
         log::warn!("AudioParamProcessor: Dropping incoming message {msg:?}");
     }
+
+    /// The last quantum started idle and armed the idle fast path, so the
+    /// next one would take it (nothing but a message can change the timeline,
+    /// the intrinsic value or the output buffer of a param whose input is
+    /// unconnected), and the fast path only re-stores the
+    /// `[[current value]]` this quantum already stored.
+    fn param_settled(&self) -> bool {
+        self.idle_output.is_some()
+    }
 }
 
 impl AudioParamProcessor {
