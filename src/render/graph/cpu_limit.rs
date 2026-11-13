@@ -4,10 +4,10 @@
 //!
 //! Whatever needs file IO, allocation or a variable-size OS query (the core
 //! topology, the cgroup quota, the logical CPU count, the CPUs of each Windows
-//! processor group) is read once by [`prime`], off the render thread, and
-//! cached. On the render thread [`usable_cpus`] and [`usable_cores`] only read
+//! processor group) is read once by `prime`, off the render thread, and
+//! cached. On the render thread `usable_cpus` and `usable_cores` only read
 //! the current affinity (a syscall or two into stack buffers) and count over
-//! the cache: no allocation, lock or file IO. Before [`prime`] they return
+//! the cache: no allocation, lock or file IO. Before `prime` they return
 //! `usize::MAX` (no limit known); the graph primes whenever it is set to
 //! render on more than one thread.
 //!
@@ -552,7 +552,7 @@ mod tests {
         prime();
         let cpus = usable_cpus();
         let cores = usable_cores();
-        assert!(cpus >= 1 && cpus < usize::MAX);
+        assert!((1..usize::MAX).contains(&cpus));
         assert!(cores >= 1 && cores <= cpus, "{cores} cores > {cpus} CPUs");
         eprintln!(
             "usable: {cores} cores, {cpus} CPUs of {} logical",

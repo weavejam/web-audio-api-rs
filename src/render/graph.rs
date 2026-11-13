@@ -3191,7 +3191,9 @@ mod tests {
         let missed = std::sync::Arc::new(AtomicUsize::new(0));
         let acked = std::sync::Arc::new(AtomicU64::new(0));
         let worker = {
-            let (shared, missed, acked) = (shared.clone(), missed.clone(), acked.clone());
+            let shared = std::sync::Arc::clone(&shared);
+            let missed = std::sync::Arc::clone(&missed);
+            let acked = std::sync::Arc::clone(&acked);
             std::thread::spawn(move || {
                 let mut seen = 0;
                 while seen != EPOCHS {
