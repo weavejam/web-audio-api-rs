@@ -312,8 +312,7 @@ impl AudioWorkletNode {
                 processor_param_map.insert(name, proc);
             }
 
-            let reported_latency =
-                std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let reported_latency = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
 
             let node = AudioWorkletNode {
                 registration,

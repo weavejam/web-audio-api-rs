@@ -71,6 +71,49 @@ pub struct Node {
     /// share processor state (the delay line) with no graph edge left between
     /// them, so the partition planner must keep them on the same render thread.
     cycle_break_partners: SmallVec<[AudioNodeId; 1]>,
+    /// The processor is an `AudioParamProcessor` (set once, in `add_node`).
+    is_audio_param: bool,
+    /// AudioParam nodes evaluated inline, right before this node's own
+    /// `process`, instead of as separate entries of the render order (see
+    /// [`Graph::assign_inline_params`]). Recomputed on every re-ordering.
+    inline_params: SmallVec<[AudioNodeId; 4]>,
+}
+
+/// Evaluate the AudioParams that `owner` reads, inline (see
+/// [`Graph::assign_inline_params`]). Such a param has no incoming edge and its
+/// only outgoing edge is the hidden one into its owner, so evaluating it right
+/// before the owner is what the topological order does, minus the per-node
+/// render-loop work that does nothing for it: no edge to push, nothing to
+/// sum into or clear in its (silent, unconnected) input, and it cannot be
+/// freed while it still feeds its owner.
+///
+/// Called inside the owner's `catch_unwind`: a panicking param takes its owner
+/// down with it (the error is reported with the param's id). The owner would
+/// fail on its next read of the vanished param anyway; this way the param is
+/// handed back to the render order when its owner is freed and freed there.
+#[inline]
+fn process_inline_params(
+    nodes: &NodeCollection,
+    inline_params: &[AudioNodeId],
+    scope: &AudioWorkletGlobalScope,
+) {
+    for &id in inline_params {
+        let mut param = nodes.get_unchecked(id).borrow_mut();
+        scope.node_id.set(id);
+        param.process(AudioParamValues::from(nodes), scope);
+        // An inline param has no incoming edge, but its input can still hold
+        // residue summed in while it was an ordinary node that was not
+        // rendered (muted in a cycle that is then broken). The render loop
+        // consumes such residue once and clears it after `process`; do the
+        // same, or the stale modulation is added again every quantum.
+        if param.has_inputs_connected {
+            param
+                .inputs
+                .iter_mut()
+                .for_each(AudioRenderQuantum::make_silent);
+            param.has_inputs_connected = false;
+        }
+    }
 }
 
 impl std::fmt::Debug for Node {
@@ -183,6 +226,15 @@ pub(crate) struct Graph {
     /// partition's first node id, to seed the next plan's schedule.
     #[cfg(not(target_arch = "wasm32"))]
     partition_cost_memory: std::collections::HashMap<u64, u64>,
+    /// Evaluate unconnected AudioParams inside their owner (default on; native
+    /// builds can turn it off with `WEB_AUDIO_RS_INLINE_PARAMS=0` for A/B runs).
+    /// Output is byte-identical either way.
+    inline_params: bool,
+    /// Scratch for [`Graph::assign_inline_params`], indexed by `AudioNodeId.0`.
+    inline_scratch: Vec<u8>,
+    /// Inline params whose owner was freed this quantum; they rejoin `ordered`
+    /// once the freed nodes are trimmed from it.
+    orphaned_params: Vec<AudioNodeId>,
 }
 
 impl std::fmt::Debug for Graph {
@@ -794,7 +846,13 @@ fn process_node_threaded(
     let params = AudioParamValues::from(nodes);
     scope.node_id.set(index);
     let (success, tail_time) = {
-        let catch_me = AssertUnwindSafe(|| node.process(params, scope));
+        let catch_me = AssertUnwindSafe(|| {
+            if !node.inline_params.is_empty() {
+                process_inline_params(nodes, &node.inline_params, scope);
+                scope.node_id.set(index);
+            }
+            node.process(params, scope)
+        });
         match panic::catch_unwind(catch_me) {
             Ok(tail_time) => (true, tail_time),
             Err(e) => {
@@ -865,6 +923,20 @@ impl Graph {
         #[cfg(target_arch = "wasm32")]
         let parallel_workers = 0;
 
+        #[cfg(not(target_arch = "wasm32"))]
+        let inline_params =
+            !std::env::var("WEB_AUDIO_RS_INLINE_PARAMS").is_ok_and(|v| v == "0" || v == "false");
+        #[cfg(target_arch = "wasm32")]
+        let inline_params = true;
+        #[cfg(test)]
+        let inline_params = tests::INLINE_PARAMS_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(inline_params);
+        #[cfg(test)]
+        let parallel_workers = tests::PARALLEL_OVERRIDE
+            .with(std::cell::Cell::get)
+            .unwrap_or(parallel_workers);
+
         Graph {
             nodes: NodeCollection::new(),
             alloc: Alloc::with_capacity(64),
@@ -885,6 +957,9 @@ impl Graph {
             boundary_store: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             partition_cost_memory: std::collections::HashMap::new(),
+            inline_params,
+            inline_scratch: Vec::new(),
+            orphaned_params: Vec::new(),
         }
     }
 
@@ -958,7 +1033,17 @@ impl Graph {
             active: self.is_active(),
             node_count,
             edge_count,
-            ordered: self.ordered.iter().map(|id| id.0).collect(),
+            // the processing order: inline params right before their owner
+            ordered: self
+                .ordered
+                .iter()
+                .flat_map(|&id| {
+                    let node = self.nodes.get_unchecked(id).borrow();
+                    let mut ids: Vec<u64> = node.inline_params.iter().map(|p| p.0).collect();
+                    ids.push(id.0);
+                    ids
+                })
+                .collect(),
             in_cycle: self.in_cycle.iter().map(|id| id.0).collect(),
             cycle_breakers,
             nodes,
@@ -986,6 +1071,8 @@ impl Graph {
         // necessary
         let inputs = vec![AudioRenderQuantum::from(self.alloc.silence()); number_of_inputs];
         let outputs = vec![AudioRenderQuantum::from(self.alloc.silence()); number_of_outputs];
+        let is_audio_param =
+            processor.name() == std::any::type_name::<crate::param::AudioParamProcessor>();
 
         self.nodes.insert(
             index,
@@ -1000,6 +1087,8 @@ impl Graph {
                 has_inputs_connected: false,
                 cycle_breaker: false,
                 cycle_break_partners: smallvec![],
+                is_audio_param,
+                inline_params: smallvec![],
             }),
         );
 
@@ -1238,6 +1327,87 @@ impl Graph {
         self.marked_temp = marked_temp;
         self.in_cycle = in_cycle;
         self.cycle_breakers = cycle_breakers;
+
+        self.assign_inline_params();
+    }
+
+    /// Move AudioParams out of the render order and into their owner's
+    /// `inline_params`, where they are evaluated right before the owner.
+    ///
+    /// A param qualifies when nothing is connected into it (no incoming edge,
+    /// so its input stays silent and its value depends only on its own
+    /// timeline and the quantum's time) and its only outgoing edge is the
+    /// hidden one into an owner that is itself rendered (not muted in a
+    /// cycle). Evaluating it later in the quantum, right before the one node
+    /// that reads it, then computes exactly the same values. A `connect()`
+    /// into the param adds an edge, which re-orders the graph: from the next
+    /// quantum on it is an ordinary node again, with its timeline state intact
+    /// (the state lives in the processor, not in the graph), so the switch is
+    /// on a quantum boundary and sample-exact.
+    fn assign_inline_params(&mut self) {
+        for node in self.nodes.values_mut() {
+            node.get_mut().inline_params.clear();
+        }
+        if !self.inline_params {
+            return;
+        }
+
+        const HAS_INCOMING: u8 = 1;
+        const RENDERED: u8 = 2;
+        let cap = self
+            .nodes
+            .keys()
+            .map(|id| id.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
+        let flags = &mut self.inline_scratch;
+        flags.clear();
+        flags.resize(cap, 0);
+        for id in self.nodes.keys() {
+            for edge in &self.nodes.get_unchecked(id).borrow().outgoing_edges {
+                flags[edge.other_id.0 as usize] |= HAS_INCOMING;
+            }
+        }
+        for id in &self.ordered {
+            flags[id.0 as usize] |= RENDERED;
+        }
+
+        let nodes = &self.nodes;
+        self.ordered.retain(|&id| {
+            let node = nodes.get_unchecked(id).borrow();
+            if !node.is_audio_param
+                || flags[id.0 as usize] & HAS_INCOMING != 0
+                || node.outgoing_edges.len() != 1
+            {
+                return true;
+            }
+            let edge = &node.outgoing_edges[0];
+            let owner = edge.other_id;
+            if edge.other_index != usize::MAX
+                || owner == id
+                || flags[owner.0 as usize] & RENDERED == 0
+            {
+                return true;
+            }
+            drop(node);
+            nodes
+                .get_unchecked(owner)
+                .borrow_mut()
+                .inline_params
+                .push(id);
+            false
+        });
+    }
+
+    /// Hand the inline params of a freed node back to the render order (call
+    /// after the freed nodes have been trimmed from `ordered`). They have no
+    /// edges left, so any position is topologically valid; rendered there they
+    /// are freed as usual once their control handle is gone.
+    fn rehome_orphaned_params(&mut self) {
+        if !self.orphaned_params.is_empty() {
+            self.ordered.append(&mut self.orphaned_params);
+            self.forget_partition_plan();
+        }
     }
 
     /// Render a single audio quantum, dispatching to the partitioned (multicore)
@@ -1282,7 +1452,13 @@ impl Graph {
                 // We are abusing AssertUnwindSafe here, we cannot guarantee it upholds.
                 // This may lead to logic bugs later on, but it is the best that we can do.
                 // The alternative is to crash and reboot the render thread.
-                let catch_me = AssertUnwindSafe(|| node.process(params, scope));
+                let catch_me = AssertUnwindSafe(|| {
+                    if !node.inline_params.is_empty() {
+                        process_inline_params(&self.nodes, &node.inline_params, scope);
+                        scope.node_id.set(*index);
+                    }
+                    node.process(params, scope)
+                });
 
                 match panic::catch_unwind(catch_me) {
                     Ok(tail_time) => (true, tail_time),
@@ -1327,6 +1503,7 @@ impl Graph {
             if can_free {
                 // Node is dropped, remove it from the node list
                 let mut node = self.nodes.remove(*index).into_inner();
+                self.orphaned_params.extend(node.inline_params.drain(..));
                 self.reclaim_id_channel
                     .push(node.reclaim_id.take().unwrap());
                 node.processor.before_drop(scope);
@@ -1358,6 +1535,7 @@ impl Graph {
                     i += 1;
                 }
             }
+            self.rehome_orphaned_params();
         }
 
         // Return the output buffer of destination node
@@ -1387,7 +1565,24 @@ impl Graph {
                 }
             }
         }
-        let is_merge: Vec<bool> = audio_in_degree.iter().map(|&d| d >= 2).collect();
+        // A node left out of `ordered` (muted in a cycle) is never processed,
+        // but the serial render still sums its producers into its input, and
+        // that residue is consumed once the cycle is broken. So it is never a
+        // merge node: every producer pushes into it directly, which co-locates
+        // all of them with it (step 2) and keeps the serial summation order.
+        let mut in_ordered = vec![false; cap];
+        for &id in &self.ordered {
+            in_ordered[id.0 as usize] = true;
+        }
+        let mut shared_unrendered = false;
+        let is_merge: Vec<bool> = audio_in_degree
+            .iter()
+            .zip(&in_ordered)
+            .map(|(&d, &rendered)| {
+                shared_unrendered |= d >= 2 && !rendered;
+                d >= 2 && rendered
+            })
+            .collect();
 
         // 2. Union-find connected components under the *uncut* edges: every
         //    AudioParam edge (so a param node stays with the node it feeds) and
@@ -1426,7 +1621,8 @@ impl Graph {
                 }
             }
         }
-        if linked_partners {
+        // Co-locating the producers of an unrendered node can close loops too.
+        if linked_partners || shared_unrendered {
             self.collapse_partition_cycles(&mut uf, &is_merge, cap);
         }
 
@@ -1472,10 +1668,9 @@ impl Graph {
                 }
                 let to = edge.other_id.0 as usize;
                 if node_group[to] == usize::MAX {
-                    // Consumer is not in `ordered` (e.g. excluded as part of a cycle).
-                    // The serial render pushes into such a node's input buffer but never
-                    // processes it, so it cannot affect the destination output. Skip it:
-                    // it must not create a boundary slot or a partition-DAG edge.
+                    // Consumer is not in `ordered` (excluded as part of a cycle): a
+                    // direct push (see `is_merge`), never a boundary slot or a
+                    // partition-DAG edge.
                     continue;
                 }
                 if !is_merge[to] {
@@ -1732,7 +1927,13 @@ impl Graph {
                 let params = AudioParamValues::from(&self.nodes);
                 scope.node_id.set(index);
                 let (success, tail_time) = {
-                    let catch_me = AssertUnwindSafe(|| node.process(params, scope));
+                    let catch_me = AssertUnwindSafe(|| {
+                        if !node.inline_params.is_empty() {
+                            process_inline_params(&self.nodes, &node.inline_params, scope);
+                            scope.node_id.set(index);
+                        }
+                        node.process(params, scope)
+                    });
                     match panic::catch_unwind(catch_me) {
                         Ok(tail_time) => (true, tail_time),
                         Err(e) => {
@@ -1776,6 +1977,7 @@ impl Graph {
 
                 if can_free {
                     let mut node = self.nodes.remove(index).into_inner();
+                    self.orphaned_params.extend(node.inline_params.drain(..));
                     self.reclaim_id_channel
                         .push(node.reclaim_id.take().unwrap());
                     node.processor.before_drop(scope);
@@ -1803,6 +2005,7 @@ impl Graph {
                     i += 1;
                 }
             }
+            self.rehome_orphaned_params();
             // leave self.partition_plan == None -> recompute next quantum
         } else {
             self.partition_plan = Some(plan);
@@ -2007,6 +2210,7 @@ impl Graph {
                     continue;
                 }
                 let mut node = self.nodes.remove(index).into_inner();
+                self.orphaned_params.extend(node.inline_params.drain(..));
                 self.reclaim_id_channel
                     .push(node.reclaim_id.take().unwrap());
                 scope.node_id.set(index);
@@ -2032,6 +2236,7 @@ impl Graph {
                     i += 1;
                 }
             }
+            self.rehome_orphaned_params();
             // leave self.partition_plan == None -> recompute next quantum, seeded
             // with this plan's measured costs
             self.remember_partition_costs(&plan);
@@ -2093,6 +2298,281 @@ impl Graph {
 mod tests {
     use super::*;
     use crate::context::DESTINATION_NODE_ID;
+
+    thread_local! {
+        /// Test-only override of the inline-params switch for graphs built on
+        /// this thread (an `OfflineAudioContext` builds its graph on the
+        /// calling thread), so A/B tests need no process-wide env var.
+        pub(super) static INLINE_PARAMS_OVERRIDE: std::cell::Cell<Option<bool>> =
+            const { std::cell::Cell::new(None) };
+        /// Test-only override of the worker count, as above.
+        pub(super) static PARALLEL_OVERRIDE: std::cell::Cell<Option<usize>> =
+            const { std::cell::Cell::new(None) };
+    }
+
+    /// Render an automation-heavy offline graph with params inline or as graph
+    /// nodes: every automation kind, k-rate and a-rate, a param that gets an
+    /// audio input connected and later disconnected mid-render, a param
+    /// connected from the start, and an owner that ends (stop + dropped handle)
+    /// while its params are inline.
+    fn render_automation_graph(inline: bool, parallel: usize) -> Vec<Vec<f32>> {
+        use crate::context::BaseAudioContext;
+        use crate::context::OfflineAudioContext;
+        use crate::node::{AudioNode, AudioScheduledSourceNode};
+        use crate::AutomationRate;
+        use std::sync::{Arc, Mutex};
+
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+        PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+        let sr = 48000.;
+        use crate::RENDER_QUANTUM_SIZE;
+        let q = RENDER_QUANTUM_SIZE as f64 / sr as f64;
+        let mut ctx = OfflineAudioContext::new(2, RENDER_QUANTUM_SIZE * 60, sr);
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+        PARALLEL_OVERRIDE.with(|o| o.set(None));
+
+        let mut osc = ctx.create_oscillator();
+        osc.set_type(crate::node::OscillatorType::Sawtooth);
+        osc.frequency().set_value_at_time(110., 0.);
+        osc.frequency().linear_ramp_to_value_at_time(440., 7.3 * q);
+        osc.frequency()
+            .exponential_ramp_to_value_at_time(220., 19.6 * q);
+        osc.detune().set_target_at_time(-300., 3.2 * q, 0.002);
+
+        let filter = ctx.create_biquad_filter();
+        filter.frequency().set_value(800.);
+        filter.frequency().set_value_curve_at_time(
+            &[300., 5000., 1200., 2500.],
+            10.4 * q,
+            12.1 * q,
+        );
+        filter.q().set_automation_rate(AutomationRate::K);
+        filter.q().linear_ramp_to_value_at_time(8., 30.5 * q);
+        filter.q().cancel_and_hold_at_time(25.25 * q);
+        filter.gain().set_value(3.);
+
+        let amp = ctx.create_gain();
+        amp.gain().set_value_at_time(0.5, 2.5 * q);
+        amp.gain().linear_ramp_to_value_at_time(1.0, 40.7 * q);
+        amp.gain().cancel_scheduled_values(33.1 * q);
+
+        let pan = ctx.create_stereo_panner();
+        pan.pan().set_value(-0.3);
+
+        // a modulator into the gain param, connected and disconnected mid-render
+        let mut lfo = ctx.create_oscillator();
+        lfo.frequency().set_value(7.);
+        let lfo_gain = ctx.create_gain();
+        lfo_gain.gain().set_value(0.25);
+        lfo.connect(&lfo_gain);
+        lfo.start();
+
+        // a modulator connected from the start (param stays a graph node)
+        let mut tremolo = ctx.create_constant_source();
+        tremolo.offset().set_value_at_time(0.1, 12.0 * q);
+        let delay = ctx.create_delay(1.);
+        delay.delay_time().set_value(0.001);
+        tremolo.connect(delay.delay_time());
+        tremolo.start();
+
+        // an owner that ends while its params are inline
+        let mut blip = ctx.create_oscillator();
+        blip.frequency().linear_ramp_to_value_at_time(990., 20. * q);
+        blip.connect(&pan);
+        blip.start();
+        blip.stop_at(14.5 * q);
+        drop(blip);
+
+        osc.connect(&filter);
+        filter.connect(&amp);
+        amp.connect(&pan);
+        pan.connect(&delay);
+        delay.connect(&ctx.destination());
+        osc.start();
+
+        let amp = Arc::new(Mutex::new(amp));
+        let lfo_gain = Arc::new(Mutex::new(lfo_gain));
+        {
+            let (amp, lfo_gain) = (Arc::clone(&amp), Arc::clone(&lfo_gain));
+            ctx.suspend_sync(17. * q, move |_| {
+                let amp = amp.lock().unwrap();
+                lfo_gain.lock().unwrap().connect(amp.gain());
+            });
+        }
+        {
+            let lfo_gain = Arc::clone(&lfo_gain);
+            ctx.suspend_sync(29. * q, move |_| {
+                lfo_gain.lock().unwrap().disconnect();
+            });
+        }
+
+        let out = ctx.start_rendering_sync();
+        (0..2).map(|c| out.get_channel_data(c).to_vec()).collect()
+    }
+
+    /// A GainNode whose gain param is fed by a constant source and by the gain
+    /// node itself: a muted cycle. While muted, the param is not rendered but
+    /// the source keeps summing into its input. After one quantum both inputs
+    /// to the param are disconnected, so it becomes inline-eligible with that
+    /// residue still in its input. Returns the first sample of each quantum.
+    fn render_broken_param_cycle(inline: bool, parallel: usize) -> Vec<f32> {
+        use crate::context::BaseAudioContext;
+        use crate::context::OfflineAudioContext;
+        use crate::node::{AudioNode, AudioScheduledSourceNode};
+        use crate::RENDER_QUANTUM_SIZE;
+        use std::sync::{Arc, Mutex};
+
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+        PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+        let sr = 48000.;
+        let q = RENDER_QUANTUM_SIZE as f64 / sr as f64;
+        let mut ctx = OfflineAudioContext::new(1, RENDER_QUANTUM_SIZE * 6, sr);
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+        PARALLEL_OVERRIDE.with(|o| o.set(None));
+
+        let mut src = ctx.create_constant_source();
+        src.offset().set_value(1.);
+        let gain = ctx.create_gain();
+        src.connect(&gain);
+        src.connect(gain.gain());
+        gain.connect(gain.gain());
+        gain.connect(&ctx.destination());
+        src.start();
+
+        let src = Arc::new(Mutex::new(src));
+        let gain = Arc::new(Mutex::new(gain));
+        ctx.suspend_sync(q, move |_| {
+            let gain = gain.lock().unwrap();
+            src.lock().unwrap().disconnect_dest(gain.gain());
+            gain.disconnect_dest(gain.gain());
+        });
+
+        let out = ctx.start_rendering_sync();
+        out.get_channel_data(0)
+            .chunks(RENDER_QUANTUM_SIZE)
+            .map(|c| c[0])
+            .collect()
+    }
+
+    #[test]
+    fn test_inline_param_drops_residue_of_broken_cycle() {
+        let reference = render_broken_param_cycle(false, 0);
+        // muted cycle, then the residue in the param input consumed once,
+        // then the plain gain of 1
+        assert_eq!(reference, [0., 4., 1., 1., 1., 1.]);
+        for (inline, parallel) in [(true, 0), (false, 2), (true, 2), (true, 3)] {
+            assert_eq!(
+                render_broken_param_cycle(inline, parallel),
+                reference,
+                "inline = {inline}, parallel = {parallel}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_inline_params_byte_identical() {
+        let reference = render_automation_graph(false, 0);
+        assert!(reference[0].iter().any(|s| *s != 0.));
+        for parallel in [0, 2, 3] {
+            let inlined = render_automation_graph(true, parallel);
+            for (a, b) in reference.iter().zip(&inlined) {
+                let a: Vec<u32> = a.iter().map(|s| s.to_bits()).collect();
+                let b: Vec<u32> = b.iter().map(|s| s.to_bits()).collect();
+                assert_eq!(a, b, "parallel = {parallel}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_inline_audio_param_lifecycle() {
+        let (node_id_producer, mut node_id_consumer) = llq::Queue::new().split();
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(true)));
+        let mut graph = Graph::new(node_id_producer);
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+
+        let node = Box::new(TestNode { tail_time: false });
+        add_node(&mut graph, 0, node.clone());
+        add_node(&mut graph, 1, node.clone());
+        // node 2 ends after one quantum; its param (3) is evaluated inline
+        add_node(&mut graph, 2, node.clone());
+        graph
+            .nodes
+            .get_unchecked_mut(AudioNodeId(2))
+            .control_handle_dropped = true;
+        add_edge(&mut graph, 2, 0);
+
+        let param = Box::new(TestNode { tail_time: true });
+        add_node(&mut graph, 3, param);
+        let p = graph.nodes.get_unchecked_mut(AudioNodeId(3));
+        p.control_handle_dropped = true;
+        p.is_audio_param = true; // as `add_node` sets it for `AudioParamProcessor`
+        add_audioparam(&mut graph, 3, 2);
+
+        let scope = AudioWorkletGlobalScope {
+            current_frame: 0,
+            current_time: 0.,
+            sample_rate: 48000.,
+            node_id: std::cell::Cell::new(AudioNodeId(0)),
+            event_sender: crossbeam_channel::unbounded().0,
+        };
+
+        graph.render(&scope); // node is dropped, its inline param rejoins the order
+        assert!(!graph.ordered.contains(&AudioNodeId(2)));
+        assert!(graph.ordered.contains(&AudioNodeId(3)));
+        graph.render(&scope); // param is dropped
+
+        assert_eq!(node_id_consumer.pop().unwrap().0, 2);
+        assert_eq!(node_id_consumer.pop().unwrap().0, 3);
+        assert!(node_id_consumer.pop().is_none());
+        assert!(graph.ordered.iter().all(|id| id.0 < 2));
+    }
+
+    #[test]
+    fn test_inline_params_assignment() {
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(true)));
+        let mut graph = Graph::new(llq::Queue::new().split().0);
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+        let node = Box::new(TestNode { tail_time: true });
+        for id in 0..6 {
+            add_node(&mut graph, id, node.clone());
+        }
+        for id in 3..6 {
+            graph
+                .nodes
+                .get_unchecked_mut(AudioNodeId(id))
+                .is_audio_param = true;
+        }
+        add_edge(&mut graph, 2, 0);
+        add_audioparam(&mut graph, 3, 2); // plain param: inline
+        add_audioparam(&mut graph, 4, 2); // modulated param: stays a node
+        add_edge(&mut graph, 1, 4);
+        add_audioparam(&mut graph, 5, 2); // also feeds audio: stays a node
+        add_edge(&mut graph, 5, 0);
+
+        graph.order_nodes();
+        assert!(!graph.ordered.contains(&AudioNodeId(3)));
+        assert!(graph.ordered.contains(&AudioNodeId(4)));
+        assert!(graph.ordered.contains(&AudioNodeId(5)));
+        assert_eq!(
+            graph
+                .nodes
+                .get_unchecked(AudioNodeId(2))
+                .borrow()
+                .inline_params[..],
+            [AudioNodeId(3)]
+        );
+
+        // connecting into the inline param turns it back into a graph node
+        add_edge(&mut graph, 1, 3);
+        graph.order_nodes();
+        assert!(graph.ordered.contains(&AudioNodeId(3)));
+        assert!(graph
+            .nodes
+            .get_unchecked(AudioNodeId(2))
+            .borrow()
+            .inline_params
+            .is_empty());
+    }
 
     #[derive(Debug, Clone)]
     struct TestNode {
