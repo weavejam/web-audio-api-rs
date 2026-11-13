@@ -270,6 +270,10 @@ pub(crate) struct Graph {
     /// `WEB_AUDIO_RS_PARAMS_CLEAN=0` for A/B runs). Output is byte-identical
     /// either way.
     params_clean: bool,
+    /// Test-only: [`Graph::mark_params_dirty`] does nothing, so tests can show
+    /// that each params-clean regression case fails without its reset.
+    #[cfg(test)]
+    drop_param_resets: bool,
     /// Scratch for [`Graph::assign_inline_params`], indexed by `AudioNodeId.0`.
     inline_scratch: Vec<u8>,
     /// Inline params whose owner was freed this quantum; they rejoin `ordered`
@@ -798,6 +802,7 @@ fn worker_render_loop(
 /// epoch, then runs its nodes in serial order and publishes its own `done`.
 /// Returns the end-of-life node ids it recorded.
 #[cfg(not(target_arch = "wasm32"))]
+#[allow(clippy::too_many_arguments)]
 fn run_worker_list(
     w: usize,
     nodes: &NodeCollection,
@@ -1012,6 +1017,8 @@ impl Graph {
             partition_cost_memory: std::collections::HashMap::new(),
             inline_params,
             params_clean,
+            #[cfg(test)]
+            drop_param_resets: tests::DROP_PARAM_RESETS_OVERRIDE.with(std::cell::Cell::get),
             inline_scratch: Vec::new(),
             orphaned_params: Vec::new(),
         }
@@ -1226,6 +1233,10 @@ impl Graph {
     /// Something may have changed what node `index` computes: if it is a param
     /// evaluated inline, its owner must evaluate its params again.
     fn mark_params_dirty(&mut self, index: AudioNodeId) {
+        #[cfg(test)]
+        if self.drop_param_resets {
+            return;
+        }
         if let Some(owner) = self.nodes.get_unchecked_mut(index).inline_owner {
             self.nodes.get_unchecked_mut(owner).params_clean = false;
         }
@@ -2382,14 +2393,25 @@ mod tests {
         /// Test-only override of the worker count, as above.
         pub(super) static PARALLEL_OVERRIDE: std::cell::Cell<Option<usize>> =
             const { std::cell::Cell::new(None) };
+        /// Test-only: graphs built on this thread drop the resets of
+        /// `mark_params_dirty` (see `Graph::drop_param_resets`).
+        pub(super) static DROP_PARAM_RESETS_OVERRIDE: std::cell::Cell<bool> =
+            const { std::cell::Cell::new(false) };
     }
 
     /// Render an automation-heavy offline graph with params inline or as graph
     /// nodes: every automation kind, k-rate and a-rate, a param that gets an
     /// audio input connected and later disconnected mid-render, a param
     /// connected from the start, and an owner that ends (stop + dropped handle)
-    /// while its params are inline.
-    fn render_automation_graph(inline: bool, clean: bool, parallel: usize) -> Vec<Vec<f32>> {
+    /// while its params are inline. `changes` are applied from the control
+    /// side to params that have been settled (idle) for many quanta.
+    fn render_automation_graph(
+        inline: bool,
+        clean: bool,
+        parallel: usize,
+        changes: &[SettledChange],
+        drop_resets: bool,
+    ) -> Vec<Vec<f32>> {
         use crate::context::BaseAudioContext;
         use crate::context::OfflineAudioContext;
         use crate::node::{AudioNode, AudioScheduledSourceNode};
@@ -2399,6 +2421,7 @@ mod tests {
         INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
         PARAMS_CLEAN_OVERRIDE.with(|o| o.set(Some(clean)));
         PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+        DROP_PARAM_RESETS_OVERRIDE.with(|o| o.set(drop_resets));
         let sr = 48000.;
         use crate::RENDER_QUANTUM_SIZE;
         let q = RENDER_QUANTUM_SIZE as f64 / sr as f64;
@@ -2406,6 +2429,7 @@ mod tests {
         INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
         PARAMS_CLEAN_OVERRIDE.with(|o| o.set(None));
         PARALLEL_OVERRIDE.with(|o| o.set(None));
+        DROP_PARAM_RESETS_OVERRIDE.with(|o| o.set(false));
 
         let mut osc = ctx.create_oscillator();
         osc.set_type(crate::node::OscillatorType::Sawtooth);
@@ -2482,46 +2506,70 @@ mod tests {
             });
         }
 
-        // Params idle (settled) for many quanta, then changed from the control
-        // side: their owner must evaluate them again from the next quantum.
+        {
+            // the LFO modulates again, so its frequency is audible
+            let (amp, lfo_gain) = (Arc::clone(&amp), Arc::clone(&lfo_gain));
+            ctx.suspend_sync(53. * q, move |_| {
+                let amp = amp.lock().unwrap();
+                lfo_gain.lock().unwrap().connect(amp.gain());
+            });
+        }
+
         let pan = Arc::new(Mutex::new(pan));
         let filter = Arc::new(Mutex::new(filter));
         let lfo = Arc::new(Mutex::new(lfo));
         {
+            // A rate change cannot change what a settled param outputs (its
+            // timeline is empty); it changes how the ramp below is sampled.
+            // test_params_clean_skips_settled_params checks its reset directly.
             let pan = Arc::clone(&pan);
-            ctx.suspend_sync(40. * q, move |_| {
-                pan.lock().unwrap().pan().set_value(0.4);
-            });
-        }
-        {
-            let filter = Arc::clone(&filter);
             ctx.suspend_sync(44. * q, move |_| {
-                let filter = filter.lock().unwrap();
-                filter.gain().set_automation_rate(AutomationRate::K);
+                pan.lock()
+                    .unwrap()
+                    .pan()
+                    .set_automation_rate(AutomationRate::K);
             });
         }
-        {
-            let filter = Arc::clone(&filter);
-            // a future event, scheduled while the param is settled
-            ctx.suspend_sync(45. * q, move |_| {
-                let filter = filter.lock().unwrap();
-                filter.gain().set_value_at_time(-6., 51.5 * q);
-                filter.frequency().set_value(1800.);
-            });
-        }
-        {
-            let (lfo, amp) = (Arc::clone(&lfo), Arc::clone(&amp));
-            ctx.suspend_sync(56. * q, move |_| {
-                lfo.lock().unwrap().frequency().set_value(3.);
-                amp.lock().unwrap().gain().set_value(0.75);
-            });
-        }
-        {
-            let pan = Arc::clone(&pan);
-            ctx.suspend_sync(60. * q, move |_| {
-                let pan = pan.lock().unwrap();
-                pan.pan().linear_ramp_to_value_at_time(-0.8, 66.2 * q);
-            });
+
+        // Params idle (settled) for many quanta, then changed from the control
+        // side: their owner must evaluate them again from the next quantum.
+        // Each change is the only one its owner gets at that time, and each is
+        // audible (test_params_clean_resets_are_audible).
+        for &change in changes {
+            match change {
+                SettledChange::PanValue => {
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(40. * q, move |_| {
+                        pan.lock().unwrap().pan().set_value(0.4);
+                    });
+                }
+                SettledChange::PanFutureEvent => {
+                    // scheduled while the param is settled, due 6.5 quanta later
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(45. * q, move |_| {
+                        pan.lock().unwrap().pan().set_value_at_time(0.1, 51.5 * q);
+                    });
+                }
+                SettledChange::FilterFrequency => {
+                    let filter = Arc::clone(&filter);
+                    ctx.suspend_sync(46. * q, move |_| {
+                        filter.lock().unwrap().frequency().set_value(1800.);
+                    });
+                }
+                SettledChange::LfoFrequency => {
+                    let lfo = Arc::clone(&lfo);
+                    ctx.suspend_sync(56. * q, move |_| {
+                        lfo.lock().unwrap().frequency().set_value(3.);
+                    });
+                }
+                SettledChange::PanRamp => {
+                    let pan = Arc::clone(&pan);
+                    ctx.suspend_sync(60. * q, move |_| {
+                        let pan = pan.lock().unwrap();
+                        pan.pan().linear_ramp_to_value_at_time(-0.8, 66.2 * q);
+                    });
+                }
+            }
         }
 
         let out = ctx.start_rendering_sync();
@@ -2587,13 +2635,75 @@ mod tests {
         }
     }
 
+    /// A control-side change to a param that has been settled for many quanta
+    /// (see [`render_automation_graph`]).
+    #[derive(Clone, Copy, Debug)]
+    enum SettledChange {
+        /// `set_value` on the stereo panner's pan.
+        PanValue,
+        /// A `set_value_at_time` on the pan that is due 6.5 quanta after it
+        /// arrives: the param is not settled while it waits.
+        PanFutureEvent,
+        /// `set_value` on the low-pass filter's frequency.
+        FilterFrequency,
+        /// `set_value` on the frequency of an LFO that modulates the gain again
+        /// (reconnected 3 quanta earlier).
+        LfoFrequency,
+        /// A ramp on the (k-rate by then) pan.
+        PanRamp,
+    }
+
+    const SETTLED_CHANGES: [SettledChange; 5] = [
+        SettledChange::PanValue,
+        SettledChange::PanFutureEvent,
+        SettledChange::FilterFrequency,
+        SettledChange::LfoFrequency,
+        SettledChange::PanRamp,
+    ];
+
+    fn bits(channels: &[Vec<f32>]) -> Vec<Vec<u32>> {
+        channels
+            .iter()
+            .map(|c| c.iter().map(|s| s.to_bits()).collect())
+            .collect()
+    }
+
+    /// Each settled-param change is audible and needs its reset: with params
+    /// clean the render matches the reference, and with the resets of
+    /// `mark_params_dirty` dropped it does not (while the graph without the
+    /// change still does, so the difference is that change's alone).
+    #[test]
+    fn test_params_clean_resets_are_audible() {
+        let base = bits(&render_automation_graph(false, false, 0, &[], false));
+        assert_eq!(
+            bits(&render_automation_graph(true, true, 0, &[], true)),
+            base,
+            "no change, resets dropped"
+        );
+        for change in SETTLED_CHANGES {
+            let reference = bits(&render_automation_graph(false, false, 0, &[change], false));
+            assert_ne!(reference, base, "{change:?} is audible");
+            assert_eq!(
+                bits(&render_automation_graph(true, true, 0, &[change], false)),
+                reference,
+                "{change:?}, params clean"
+            );
+            assert_ne!(
+                bits(&render_automation_graph(true, true, 0, &[change], true)),
+                reference,
+                "{change:?} must fail without its reset"
+            );
+        }
+    }
+
     #[test]
     fn test_inline_params_byte_identical() {
-        let reference = render_automation_graph(false, false, 0);
+        let reference = render_automation_graph(false, false, 0, &SETTLED_CHANGES, false);
         assert!(reference[0].iter().any(|s| *s != 0.));
         for parallel in [0, 2, 3] {
             for (inline, clean) in [(false, true), (true, false), (true, true)] {
-                let rendered = render_automation_graph(inline, clean, parallel);
+                let rendered =
+                    render_automation_graph(inline, clean, parallel, &SETTLED_CHANGES, false);
                 for (a, b) in reference.iter().zip(&rendered) {
                     let a: Vec<u32> = a.iter().map(|s| s.to_bits()).collect();
                     let b: Vec<u32> = b.iter().map(|s| s.to_bits()).collect();
@@ -2646,7 +2756,11 @@ mod tests {
             add_node(&mut graph, 2, node.clone());
             add_edge(&mut graph, 2, 0);
             let calls = std::sync::Arc::new(AtomicUsize::new(0));
-            add_node(&mut graph, 3, Box::new(CountingParam(calls.clone())));
+            add_node(
+                &mut graph,
+                3,
+                Box::new(CountingParam(std::sync::Arc::clone(&calls))),
+            );
             graph.nodes.get_unchecked_mut(AudioNodeId(3)).is_audio_param = true;
             add_audioparam(&mut graph, 3, 2);
 
@@ -2672,6 +2786,27 @@ mod tests {
             graph.route_message(AudioNodeId(3), &mut ());
             step(&mut graph, true, "message to the param");
             step(&mut graph, false, "settled again");
+            // an automation-rate change cannot change a settled param's output,
+            // so check its reset directly
+            let owner_clean = |graph: &Graph| {
+                graph
+                    .nodes
+                    .get_unchecked(AudioNodeId(2))
+                    .borrow()
+                    .params_clean
+            };
+            assert_eq!(owner_clean(&graph), clean);
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::K);
+            assert!(!owner_clean(&graph), "rate message clears params_clean");
+            step(&mut graph, true, "automation rate of the param");
+            assert_eq!(owner_clean(&graph), clean);
+            graph.drop_param_resets = true;
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::A);
+            assert_eq!(owner_clean(&graph), clean, "flag kept without the reset");
+            graph.drop_param_resets = false;
+            step(&mut graph, false, "skipped without the reset");
+            graph.route_message(AudioNodeId(3), &mut crate::AutomationRate::A);
+            step(&mut graph, true, "automation rate of the param, again");
             graph.route_message(AudioNodeId(2), &mut ());
             step(
                 &mut graph,

@@ -1006,13 +1006,17 @@ mod tests {
         out
     }
 
+    /// One channel as [`add_observable`] sees it: silent, sample bits, which
+    /// channels of the quantum share its buffer, which input channels do.
+    type ChannelObservation = (bool, Vec<u32>, Vec<bool>, Vec<bool>);
+
     /// Everything about a quantum that later processing can observe: channel
     /// count, per channel the sample bits and silence, which channels share a
     /// buffer, and which share one with the given inputs.
     fn add_observable(
         q: &AudioRenderQuantum,
         inputs: &[&AudioRenderQuantum],
-    ) -> Vec<(bool, Vec<u32>, Vec<bool>, Vec<bool>)> {
+    ) -> Vec<ChannelObservation> {
         q.channels
             .iter()
             .map(|c| {
