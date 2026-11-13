@@ -582,8 +582,10 @@ impl PoolTask {
 /// touched between the start and the end of an epoch (one quantum):
 ///
 /// * Start: the main thread writes `task` and resets the per-partition
-///   `remaining` counts and the epoch counters, then stores the new `epoch` and
-///   opens it (`open`). A worker joins an epoch by incrementing `active`, then
+///   `remaining` counts and the epoch counters, then opens the new epoch
+///   (`open`) and only then publishes it (`epoch`, Release), so a worker that
+///   sees the new `epoch` finds it open (see [`PoolShared::start_epoch`]).
+///   A worker joins an epoch by incrementing `active`, then
 ///   checking that `open` still holds that epoch (both SeqCst, against the
 ///   main thread's SeqCst close followed by its read of `active`). Only a worker
 ///   that joined reads `task`, so a worker that wakes late, after the quantum
@@ -632,6 +634,62 @@ struct PoolShared {
     slots: Vec<std::cell::UnsafeCell<Vec<AudioNodeId>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl PoolShared {
+    fn new(n_workers: usize) -> Self {
+        PoolShared {
+            epoch: std::sync::atomic::AtomicU64::new(0),
+            open: std::sync::atomic::AtomicU64::new(0),
+            active: std::sync::atomic::AtomicUsize::new(0),
+            unclaimed: std::sync::atomic::AtomicUsize::new(0),
+            completed: std::sync::atomic::AtomicUsize::new(0),
+            shutdown: std::sync::atomic::AtomicBool::new(false),
+            task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
+            slots: (1..n_workers)
+                .map(|_| std::cell::UnsafeCell::new(Vec::new()))
+                .collect(),
+        }
+    }
+
+    /// Start `epoch` (main thread), once its task and counters are written.
+    /// Open it first, then publish it: a worker that saw the new `epoch` before
+    /// it was open would leave and wait for the epoch after, and the quantum
+    /// would run without it.
+    fn start_epoch(&self, epoch: u64) {
+        use std::sync::atomic::Ordering;
+        self.open.store(epoch, Ordering::SeqCst);
+        self.epoch.store(epoch, Ordering::Release);
+    }
+
+    /// Join `epoch` (a spawned worker that saw it published): announce, then
+    /// check it is still open. `false` if the main thread already closed it;
+    /// it then does not wait for us and we must not touch its state.
+    fn try_join(&self, epoch: u64) -> bool {
+        use std::sync::atomic::Ordering;
+        self.active.fetch_add(1, Ordering::SeqCst);
+        if self.open.load(Ordering::SeqCst) == epoch {
+            return true;
+        }
+        self.active.fetch_sub(1, Ordering::Release);
+        false
+    }
+
+    /// Close the current epoch (main thread) so no late worker joins, then wait
+    /// for the workers still inside it to leave. Each published its free-list
+    /// before its `active` decrement (Release); the Acquire fence after our
+    /// last load orders both their slot writes and all their node/boundary
+    /// accesses before ours.
+    fn close_epoch(&self) {
+        use std::sync::atomic::Ordering;
+        self.open.store(0, Ordering::SeqCst);
+        let mut backoff = Backoff::new();
+        while self.active.load(Ordering::SeqCst) != 0 {
+            backoff.snooze();
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+    }
+}
+
 // SAFETY: see the type-level doc — all shared access is barrier-ordered and
 // index-disjoint, so concurrent reads/writes never alias.
 #[cfg(not(target_arch = "wasm32"))]
@@ -672,18 +730,7 @@ impl WorkerPool {
         n_workers: usize,
         event_sender: &crossbeam_channel::Sender<crate::events::EventDispatch>,
     ) -> Self {
-        let shared = std::sync::Arc::new(PoolShared {
-            epoch: std::sync::atomic::AtomicU64::new(0),
-            open: std::sync::atomic::AtomicU64::new(0),
-            active: std::sync::atomic::AtomicUsize::new(0),
-            unclaimed: std::sync::atomic::AtomicUsize::new(0),
-            completed: std::sync::atomic::AtomicUsize::new(0),
-            shutdown: std::sync::atomic::AtomicBool::new(false),
-            task: std::cell::UnsafeCell::new(PoolTask::EMPTY),
-            slots: (1..n_workers)
-                .map(|_| std::cell::UnsafeCell::new(Vec::new()))
-                .collect(),
-        });
+        let shared = std::sync::Arc::new(PoolShared::new(n_workers));
 
         let handles = (1..n_workers)
             .map(|w| {
@@ -704,250 +751,9 @@ impl WorkerPool {
     }
 }
 
-/// How many CPUs this process may run on: its affinity mask where the OS has
-/// one, else the logical CPU count. `std::thread::available_parallelism`
-/// ignores the process affinity on Windows, and on Linux it also reads cgroup
-/// files, which the render thread must not do; so both are queried directly.
-/// Cheap enough (one syscall) to call on the render thread now and then.
-///
-/// `usable_cores` counts physical cores instead (SMT siblings once): the
-/// "all cores" setting uses that, as a second hardware thread on a busy core
-/// adds little to a render and slows the thread it shares the core with.
-/// The core topology is read once (`prime`), off the render thread.
+/// Thread limits of the parallel executor (affinity, cores, cgroup quota).
 #[cfg(not(target_arch = "wasm32"))]
-mod cpu_limit {
-    fn logical_cpus() -> usize {
-        static LOGICAL: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        *LOGICAL.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
-    }
-
-    /// Per logical CPU: whether a lower-numbered CPU shares its physical core.
-    /// Empty if the topology is unknown (then every CPU counts as a core).
-    fn smt_sibling_of_lower() -> &'static [bool] {
-        static TOPOLOGY: std::sync::OnceLock<Vec<bool>> = std::sync::OnceLock::new();
-        TOPOLOGY.get_or_init(read_topology)
-    }
-
-    /// Read the core topology now, so [`usable_cores`] never does on the
-    /// render thread.
-    pub(super) fn prime() {
-        let _ = smt_sibling_of_lower();
-    }
-
-    /// Number of physical cores among the CPUs this process may run on.
-    pub(super) fn usable_cores() -> usize {
-        let lower = smt_sibling_of_lower();
-        let mut cores = 0;
-        let mut any = false;
-        for_each_usable_cpu(|cpu| {
-            any = true;
-            if !lower.get(cpu).copied().unwrap_or(false) {
-                cores += 1;
-            }
-        });
-        if any {
-            cores.max(1)
-        } else {
-            usable_cpus()
-        }
-    }
-
-    /// From groups of CPUs that share a core, mark every CPU above the lowest
-    /// of its group.
-    #[cfg_attr(
-        not(any(target_os = "windows", target_os = "linux", target_os = "android")),
-        allow(dead_code)
-    )]
-    fn mark_siblings(groups: impl Iterator<Item = Vec<usize>>) -> Vec<bool> {
-        let mut lower = Vec::new();
-        for mut group in groups {
-            group.sort_unstable();
-            for &cpu in group.iter().skip(1) {
-                if lower.len() <= cpu {
-                    lower.resize(cpu + 1, false);
-                }
-                lower[cpu] = true;
-            }
-        }
-        lower
-    }
-
-    #[cfg(target_os = "windows")]
-    mod os {
-        use std::ffi::c_void;
-
-        #[repr(C)]
-        struct LogicalProcessorInformation {
-            processor_mask: usize,
-            relationship: u32,
-            union: [u64; 2],
-        }
-        const RELATION_PROCESSOR_CORE: u32 = 0;
-
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn GetCurrentProcess() -> *mut c_void;
-            fn GetProcessAffinityMask(
-                process: *mut c_void,
-                process_mask: *mut usize,
-                system_mask: *mut usize,
-            ) -> i32;
-            fn GetLogicalProcessorInformation(
-                buffer: *mut LogicalProcessorInformation,
-                length: *mut u32,
-            ) -> i32;
-        }
-
-        /// The process affinity mask, or `None` when the process spans
-        /// several processor groups (> 64 CPUs; both masks are then 0).
-        pub(super) fn process_mask() -> Option<usize> {
-            let mut process_mask = 0usize;
-            let mut system_mask = 0usize;
-            // SAFETY: pseudo-handle of the current process and two valid out
-            // pointers for the duration of the call.
-            let ok = unsafe {
-                GetProcessAffinityMask(GetCurrentProcess(), &mut process_mask, &mut system_mask)
-            };
-            (ok != 0 && process_mask != 0).then_some(process_mask)
-        }
-
-        pub(super) fn core_groups() -> Vec<Vec<usize>> {
-            let entry = std::mem::size_of::<LogicalProcessorInformation>();
-            let mut length = 0u32;
-            // SAFETY: a null buffer with length 0 only queries the size.
-            unsafe { GetLogicalProcessorInformation(std::ptr::null_mut(), &mut length) };
-            let mut buffer: Vec<LogicalProcessorInformation> = (0..length as usize / entry + 1)
-                .map(|_| LogicalProcessorInformation {
-                    processor_mask: 0,
-                    relationship: u32::MAX,
-                    union: [0; 2],
-                })
-                .collect();
-            let mut length = (buffer.len() * entry) as u32;
-            // SAFETY: `buffer` holds `length` bytes of properly aligned entries.
-            if unsafe { GetLogicalProcessorInformation(buffer.as_mut_ptr(), &mut length) } == 0 {
-                return Vec::new();
-            }
-            buffer.truncate(length as usize / entry);
-            buffer
-                .iter()
-                .filter(|info| info.relationship == RELATION_PROCESSOR_CORE)
-                .map(|info| {
-                    (0..usize::BITS as usize)
-                        .filter(|bit| info.processor_mask & (1 << bit) != 0)
-                        .collect()
-                })
-                .collect()
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    fn read_topology() -> Vec<bool> {
-        mark_siblings(os::core_groups().into_iter())
-    }
-
-    #[cfg(target_os = "windows")]
-    fn for_each_usable_cpu(mut f: impl FnMut(usize)) {
-        if let Some(mask) = os::process_mask() {
-            (0..usize::BITS as usize)
-                .filter(|bit| mask & (1 << bit) != 0)
-                .for_each(&mut f);
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    pub(super) fn usable_cpus() -> usize {
-        os::process_mask().map_or_else(logical_cpus, |mask| mask.count_ones() as usize)
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn affinity() -> Option<libc::cpu_set_t> {
-        // SAFETY: `cpu_set_t` is a plain bit set (all-zero is valid) and the
-        // pointer and size describe it for the duration of the call.
-        unsafe {
-            let mut set: libc::cpu_set_t = std::mem::zeroed();
-            (libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) == 0
-                && libc::CPU_COUNT(&set) > 0)
-                .then_some(set)
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn read_topology() -> Vec<bool> {
-        let read = |cpu: usize, what: &str| {
-            std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/topology/{what}"))
-                .ok()
-                .and_then(|s| s.trim().parse::<i64>().ok())
-        };
-        let mut by_core: std::collections::BTreeMap<(i64, i64), Vec<usize>> =
-            std::collections::BTreeMap::new();
-        for cpu in 0..logical_cpus().max(1) * 4 {
-            if let (Some(package), Some(core)) =
-                (read(cpu, "physical_package_id"), read(cpu, "core_id"))
-            {
-                by_core.entry((package, core)).or_default().push(cpu);
-            }
-        }
-        mark_siblings(by_core.into_values())
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    fn for_each_usable_cpu(mut f: impl FnMut(usize)) {
-        if let Some(set) = affinity() {
-            // CPU_SETSIZE is a c_int on glibc, a usize on Android.
-            #[allow(trivial_numeric_casts)]
-            let size = libc::CPU_SETSIZE as usize;
-            for cpu in 0..size {
-                // SAFETY: `cpu` is below CPU_SETSIZE.
-                if unsafe { libc::CPU_ISSET(cpu, &set) } {
-                    f(cpu);
-                }
-            }
-        }
-    }
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub(super) fn usable_cpus() -> usize {
-        // SAFETY: `set` is a valid, initialized cpu set.
-        affinity().map_or_else(logical_cpus, |set| unsafe { libc::CPU_COUNT(&set) }
-            as usize)
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
-    fn read_topology() -> Vec<bool> {
-        Vec::new()
-    }
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
-    fn for_each_usable_cpu(_f: impl FnMut(usize)) {}
-
-    #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "android")))]
-    pub(super) fn usable_cpus() -> usize {
-        logical_cpus()
-    }
-
-    #[cfg(test)]
-    mod tests {
-        #[test]
-        fn usable_cores_and_cpus() {
-            super::prime();
-            let cpus = super::usable_cpus();
-            let cores = super::usable_cores();
-            assert!(cpus >= 1);
-            assert!(cores >= 1 && cores <= cpus, "{cores} cores > {cpus} CPUs");
-            eprintln!(
-                "usable: {cores} cores, {cpus} CPUs of {} logical",
-                super::logical_cpus()
-            );
-        }
-
-        #[test]
-        fn siblings_marked_above_the_lowest() {
-            let lower = super::mark_siblings([vec![3, 1], vec![0], vec![2, 5, 4]].into_iter());
-            assert_eq!(lower, vec![false, false, false, true, true, true]);
-        }
-    }
-}
+mod cpu_limit;
 
 /// How long an idle worker spins for the next epoch before parking. Quanta of
 /// an offline render, and the quanta within one audio callback, follow each
@@ -1076,12 +882,7 @@ fn worker_render_loop(
     let mut seen = 0;
     while let Some(epoch) = wait_for_epoch(shared, seen) {
         seen = epoch;
-        // Join the epoch (see PoolShared): announce, then check it is still
-        // open. If the main thread already closed it, it does not wait for us
-        // and we must not touch its state.
-        shared.active.fetch_add(1, Ordering::SeqCst);
-        if shared.open.load(Ordering::SeqCst) != epoch {
-            shared.active.fetch_sub(1, Ordering::Release);
+        if !shared.try_join(epoch) {
             continue;
         }
         // Processor panics are caught per node; anything that unwinds out here
@@ -1382,8 +1183,10 @@ impl Graph {
         });
         #[cfg(target_arch = "wasm32")]
         let parallel_workers = 0;
+        // Read the CPU topology and quota here, off the render thread, for
+        // every parallel setting (the executor clamps explicit counts too).
         #[cfg(not(target_arch = "wasm32"))]
-        if parallel_workers == ALL_CORES {
+        if parallel_workers >= 2 {
             cpu_limit::prime();
         }
 
@@ -1453,7 +1256,7 @@ impl Graph {
     pub(crate) fn set_parallel_workers(&mut self, workers: usize) {
         self.parallel_workers = workers;
         #[cfg(not(target_arch = "wasm32"))]
-        if workers == ALL_CORES {
+        if workers >= 2 {
             cpu_limit::prime();
         }
     }
@@ -2694,12 +2497,7 @@ impl Graph {
         for (remaining, preds) in plan.remaining.iter().zip(&plan.preds) {
             remaining.store(preds.len() as u32, std::sync::atomic::Ordering::Relaxed);
         }
-        shared
-            .epoch
-            .store(epoch, std::sync::atomic::Ordering::Release);
-        shared
-            .open
-            .store(epoch, std::sync::atomic::Ordering::SeqCst);
+        shared.start_epoch(epoch);
         for handle in &pool.handles {
             handle.thread().unpark();
         }
@@ -2734,18 +2532,9 @@ impl Graph {
             }
         };
 
-        // Every partition completed. Close the epoch so no late worker joins,
-        // then wait for the workers still inside it to leave (they only check
-        // that nothing is left to take). Each published its free-list before
-        // its `active` decrement (Release); the Acquire fence after our last
-        // load orders both their slot writes and all their node/boundary
-        // accesses before ours.
-        shared.open.store(0, std::sync::atomic::Ordering::SeqCst);
-        let mut backoff = Backoff::new();
-        while shared.active.load(std::sync::atomic::Ordering::SeqCst) != 0 {
-            backoff.snooze();
-        }
-        std::sync::atomic::fence(std::sync::atomic::Ordering::Acquire);
+        // Every partition completed. Close the epoch and wait for the workers
+        // still inside it (they only check that nothing is left to take).
+        shared.close_epoch();
         let mut freeables: Vec<Vec<AudioNodeId>> = shared
             .slots
             .iter()
@@ -3386,6 +3175,52 @@ mod tests {
             .borrow()
             .inline_params
             .is_empty());
+    }
+
+    /// A worker that sees a new epoch published finds it open: if it could see
+    /// the epoch before it was opened, it would leave, wait for the epoch after,
+    /// and that quantum would run without it. Races the real start / join /
+    /// close; the worker checks `open` right after seeing the epoch, the
+    /// widest window for the race.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_published_epoch_is_already_open() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+        const EPOCHS: u64 = 50_000;
+        let shared = std::sync::Arc::new(PoolShared::new(2));
+        let missed = std::sync::Arc::new(AtomicUsize::new(0));
+        let acked = std::sync::Arc::new(AtomicU64::new(0));
+        let worker = {
+            let (shared, missed, acked) = (shared.clone(), missed.clone(), acked.clone());
+            std::thread::spawn(move || {
+                let mut seen = 0;
+                while seen != EPOCHS {
+                    let epoch = loop {
+                        let epoch = shared.epoch.load(Ordering::Acquire);
+                        if epoch != seen {
+                            break epoch;
+                        }
+                        std::hint::spin_loop();
+                    };
+                    seen = epoch;
+                    if shared.try_join(epoch) {
+                        shared.active.fetch_sub(1, Ordering::Release);
+                    } else {
+                        missed.fetch_add(1, Ordering::Relaxed);
+                    }
+                    acked.store(epoch, Ordering::Release);
+                }
+            })
+        };
+        for epoch in 1..=EPOCHS {
+            shared.start_epoch(epoch);
+            while acked.load(Ordering::Acquire) != epoch {
+                std::hint::spin_loop();
+            }
+            shared.close_epoch();
+        }
+        worker.join().unwrap();
+        assert_eq!(missed.load(Ordering::Relaxed), 0, "epochs skipped");
     }
 
     #[derive(Debug, Clone)]
