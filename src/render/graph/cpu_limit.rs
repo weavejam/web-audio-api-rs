@@ -31,6 +31,10 @@
 //! * Windows: a process whose threads span several processor groups is told
 //!   which groups, but not a mask within each, so every active CPU of those
 //!   groups counts. This may over-count, never below one group.
+//! * Windows, 32-bit process on 64-bit Windows (WOW64): affinity masks are
+//!   32 bits wide, and WOW64 folds processor bits 32-63 of a group onto bits
+//!   0-31. Such a process sees at most 32 CPUs per group and may count a CPU
+//!   twice or one it cannot run on as usable. Only 64-bit builds are exact.
 //! * macOS/iOS: no affinity and no core topology; every logical CPU counts.
 
 use std::sync::OnceLock;
@@ -177,6 +181,39 @@ fn whole_cpus(quota: &str, period: &str) -> Option<usize> {
     (period > 0).then(|| ((quota / period) as usize).max(1))
 }
 
+/// Decode the octal escapes (`\040` space, `\011` tab, `\012` newline, `\134`
+/// backslash) the kernel writes into mountinfo path fields.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn unescape_mount_field(field: &str) -> std::borrow::Cow<'_, str> {
+    if !field.contains('\\') {
+        return std::borrow::Cow::Borrowed(field);
+    }
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let escape = bytes.get(i + 1..i + 4).filter(|d| {
+            bytes[i] == b'\\' && d[0] <= b'3' && d.iter().all(|c| (b'0'..=b'7').contains(c))
+        });
+        if let Some(d) = escape {
+            out.push((d[0] - b'0') << 6 | (d[1] - b'0') << 3 | (d[2] - b'0'));
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// `path` relative to `root`, compared by whole components, without leading
+/// or trailing `/`; `None` if `path` is not `root` or below it.
+#[cfg_attr(not(any(target_os = "linux", target_os = "android")), allow(dead_code))]
+fn path_below<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+    let rest = path.strip_prefix(root.trim_end_matches('/'))?;
+    (rest.is_empty() || rest.starts_with('/')).then(|| rest.trim_matches('/'))
+}
+
 /// The CPU budget of this process's cgroup, in whole CPUs: the smallest
 /// `cpu.max` (v2) or `cpu.cfs_quota_us / cpu.cfs_period_us` (v1) of its cgroup
 /// and every ancestor visible in the mount. `proc_cgroup` and `mountinfo` are
@@ -209,6 +246,10 @@ fn cgroup_quota(
             else {
                 continue;
             };
+            let (root, mount_point) = (
+                unescape_mount_field(root),
+                unescape_mount_field(mount_point),
+            );
             let matches = if v2 {
                 fs_type == "cgroup2"
             } else {
@@ -221,8 +262,12 @@ fn cgroup_quota(
                 continue;
             }
             // The cgroup path relative to the mount; walk from it up to the
-            // mount point. A path outside the mount: only the mount point.
-            let mut dir = path.strip_prefix(root).unwrap_or("").trim_matches('/');
+            // mount point. A mount of some other part of the hierarchy (the
+            // cgroup is not at or below its root) says nothing about this
+            // process: skip it.
+            let Some(mut dir) = path_below(path, &root) else {
+                continue;
+            };
             loop {
                 let base = if dir.is_empty() {
                     mount_point.to_string()
@@ -427,20 +472,24 @@ mod os {
         if length == 0 {
             return Vec::new();
         }
-        let mut buffer = vec![0u8; length as usize];
-        // SAFETY: `buffer` holds `length` bytes.
+        // The records hold `usize` masks; back them with `u64`s so the buffer
+        // is aligned for them (a byte buffer may not be: ERROR_NOACCESS).
+        let mut storage = vec![0u64; (length as usize).div_ceil(8)];
+        // SAFETY: `storage` holds at least `length` bytes, 8-byte aligned.
         if unsafe {
             GetLogicalProcessorInformationEx(
                 RELATION_PROCESSOR_CORE,
-                buffer.as_mut_ptr(),
+                storage.as_mut_ptr().cast::<u8>(),
                 &mut length,
             )
         } == 0
         {
             return Vec::new();
         }
-        buffer.truncate(length as usize);
-        parse_core_records(&buffer)
+        let len = (length as usize).min(storage.len() * 8);
+        // SAFETY: `len` bytes of `storage`, initialized, viewed as bytes.
+        let buffer = unsafe { std::slice::from_raw_parts(storage.as_ptr().cast::<u8>(), len) };
+        parse_core_records(buffer)
     }
 
     /// Parse `SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX` records: `u32
@@ -650,6 +699,55 @@ mod tests {
             ),
         ]);
         assert_eq!(cgroup_quota(cgroup, mountinfo, read), None);
+    }
+
+    #[test]
+    fn cgroup_mounts_of_other_cgroups_are_skipped() {
+        // A bind mount of an unrelated cgroup (quota 1) must not cap a
+        // process whose own cgroup allows 4; nor may a root that is only a
+        // string prefix of the path (`/dock` of `/docker`).
+        let mountinfo = "\
+30 25 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw
+40 25 0:26 /other /mnt/other rw - cgroup2 cgroup2 rw
+41 25 0:26 /dock /mnt/dock rw - cgroup2 cgroup2 rw";
+        let read = files(&[
+            ("/sys/fs/cgroup/docker/abc/cpu.max", "400000 100000\n"),
+            ("/mnt/other/cpu.max", "100000 100000\n"),
+            ("/mnt/dock/cpu.max", "100000 100000\n"),
+            ("/mnt/dock/er/abc/cpu.max", "100000 100000\n"),
+        ]);
+        assert_eq!(cgroup_quota("0::/docker/abc\n", mountinfo, read), Some(4));
+        assert_eq!(path_below("/docker/abc", "/docker"), Some("abc"));
+        assert_eq!(path_below("/docker", "/docker/"), Some(""));
+        assert_eq!(path_below("/dockerx/abc", "/docker"), None);
+        assert_eq!(path_below("/a", "/"), Some("a"));
+    }
+
+    #[test]
+    fn cgroup_mountinfo_escapes_are_decoded() {
+        let mountinfo = "\
+31 25 0:27 /my\\040pod /sys/fs/cgroup/cpu\\134x rw - cgroup cgroup rw,cpu";
+        let read = files(&[
+            ("/sys/fs/cgroup/cpu\\x/ctr/cpu.cfs_quota_us", "200000\n"),
+            ("/sys/fs/cgroup/cpu\\x/ctr/cpu.cfs_period_us", "100000\n"),
+        ]);
+        assert_eq!(
+            cgroup_quota("3:cpu:/my pod/ctr\n", mountinfo, read),
+            Some(2)
+        );
+        assert_eq!(unescape_mount_field("a\\011b\\012c"), "a\tb\nc");
+        assert_eq!(unescape_mount_field("plain"), "plain");
+        // Not an escape: kept as written.
+        assert_eq!(unescape_mount_field("x\\9y\\"), "x\\9y\\");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_core_query_succeeds() {
+        let cores = os::core_cpus();
+        assert!(!cores.is_empty(), "GetLogicalProcessorInformationEx failed");
+        let cpus: usize = cores.iter().map(Vec::len).sum();
+        assert!(cpus >= cores.len());
     }
 
     #[cfg(target_os = "windows")]
