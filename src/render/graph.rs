@@ -1342,7 +1342,12 @@ impl Graph {
 
         const HAS_INCOMING: u8 = 1;
         const RENDERED: u8 = 2;
-        let cap = self.nodes.keys().map(|id| id.0 as usize + 1).max().unwrap_or(0);
+        let cap = self
+            .nodes
+            .keys()
+            .map(|id| id.0 as usize + 1)
+            .max()
+            .unwrap_or(0);
         let flags = &mut self.inline_scratch;
         flags.clear();
         flags.resize(cap, 0);
@@ -1373,7 +1378,11 @@ impl Graph {
                 return true;
             }
             drop(node);
-            nodes.get_unchecked(owner).borrow_mut().inline_params.push(id);
+            nodes
+                .get_unchecked(owner)
+                .borrow_mut()
+                .inline_params
+                .push(id);
             false
         });
     }
@@ -2303,9 +2312,11 @@ mod tests {
 
         let filter = ctx.create_biquad_filter();
         filter.frequency().set_value(800.);
-        filter
-            .frequency()
-            .set_value_curve_at_time(&[300., 5000., 1200., 2500.], 10.4 * q, 12.1 * q);
+        filter.frequency().set_value_curve_at_time(
+            &[300., 5000., 1200., 2500.],
+            10.4 * q,
+            12.1 * q,
+        );
         filter.q().set_automation_rate(AutomationRate::K);
         filter.q().linear_ramp_to_value_at_time(8., 30.5 * q);
         filter.q().cancel_and_hold_at_time(25.25 * q);
@@ -2438,7 +2449,10 @@ mod tests {
             add_node(&mut graph, id, node.clone());
         }
         for id in 3..6 {
-            graph.nodes.get_unchecked_mut(AudioNodeId(id)).is_audio_param = true;
+            graph
+                .nodes
+                .get_unchecked_mut(AudioNodeId(id))
+                .is_audio_param = true;
         }
         add_edge(&mut graph, 2, 0);
         add_audioparam(&mut graph, 3, 2); // plain param: inline
@@ -2452,7 +2466,11 @@ mod tests {
         assert!(graph.ordered.contains(&AudioNodeId(4)));
         assert!(graph.ordered.contains(&AudioNodeId(5)));
         assert_eq!(
-            graph.nodes.get_unchecked(AudioNodeId(2)).borrow().inline_params[..],
+            graph
+                .nodes
+                .get_unchecked(AudioNodeId(2))
+                .borrow()
+                .inline_params[..],
             [AudioNodeId(3)]
         );
 

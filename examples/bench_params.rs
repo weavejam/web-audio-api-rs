@@ -35,7 +35,8 @@ fn render(tracks: usize, seconds: f32) -> (f64, f64, Vec<f32>) {
             gain.gain().set_value(0.9);
             if t % 8 == 0 && g == 0 {
                 // a few automated params, as in a real project
-                gain.gain().linear_ramp_to_value_at_time(0.2, seconds as f64);
+                gain.gain()
+                    .linear_ramp_to_value_at_time(0.2, seconds as f64);
             }
             prev.connect(&gain);
             prev = Box::new(gain);
