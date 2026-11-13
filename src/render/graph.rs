@@ -2948,16 +2948,33 @@ mod tests {
         for change in SETTLED_CHANGES {
             let reference = bits(&render_automation_graph(false, false, 0, &[change], false));
             assert_ne!(reference, base, "{change:?} is audible");
-            assert_eq!(
-                bits(&render_automation_graph(true, true, 0, &[change], false)),
-                reference,
-                "{change:?}, params clean"
-            );
-            assert_ne!(
-                bits(&render_automation_graph(true, true, 0, &[change], true)),
-                reference,
-                "{change:?} must fail without its reset"
-            );
+            // Parallel too: the flag is read and set by whichever thread
+            // claims the owner's partition, and reset by the render thread
+            // between quanta.
+            for parallel in [0, 2, 3] {
+                assert_eq!(
+                    bits(&render_automation_graph(
+                        true,
+                        true,
+                        parallel,
+                        &[change],
+                        false
+                    )),
+                    reference,
+                    "{change:?}, params clean, parallel = {parallel}"
+                );
+                assert_ne!(
+                    bits(&render_automation_graph(
+                        true,
+                        true,
+                        parallel,
+                        &[change],
+                        true
+                    )),
+                    reference,
+                    "{change:?} must fail without its reset, parallel = {parallel}"
+                );
+            }
         }
     }
 
