@@ -44,6 +44,11 @@ struct Callback {
 
 impl Callback {
     fn run(mut self) {
+        // This backend owns its thread: register it for realtime scheduling
+        // now, before the first deadline, instead of in the first render.
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::render::rt_thread::ensure_callback_thread_promoted();
+
         let buffer_size = RENDER_QUANTUM_SIZE; // TODO Latency Category
         let mut buffer = vec![0.; buffer_size * MAX_CHANNELS];
         let interval = Duration::from_secs_f32(buffer_size as f32 / self.sample_rate);
@@ -52,16 +57,31 @@ impl Callback {
         let mut deadline = Instant::now().checked_add(interval).unwrap();
 
         loop {
-            // poll the receiver as long as the deadline is in the future
-            while let Ok(msg) = self.receiver.recv_deadline(deadline) {
+            // Handle the pending messages, then sleep until the deadline. Not
+            // `recv_deadline`: crossbeam's blocking receive backs off with
+            // `yield_now`, which on Windows (`SwitchToThread`) hands the core to
+            // any ready thread - even one of lower priority - for the rest of its
+            // time slice, so on a saturated machine this thread rendered a
+            // quantum every ~35 ms whatever its priority. A plain sleep wakes on
+            // a (high-resolution) timer like a device callback wakes on its
+            // event. Messages wait at most one quantum.
+            let mut start_now = false;
+            while let Ok(msg) = self.receiver.try_recv() {
                 match msg {
                     NoneBackendMessage::Close => return,
                     NoneBackendMessage::Resume => {
                         self.running = true;
                         deadline = Instant::now().checked_add(interval).unwrap();
-                        break; // start processing right away
+                        start_now = true; // start processing right away
+                        break;
                     }
                     NoneBackendMessage::Suspend => self.running = false,
+                }
+            }
+            if !start_now {
+                let now = Instant::now();
+                if deadline > now {
+                    thread::sleep(deadline - now);
                 }
             }
 

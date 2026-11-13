@@ -6,6 +6,8 @@ pub(crate) mod graph;
 // pub(crate) mods
 mod thread;
 pub(crate) use thread::*;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod rt_thread;
 
 // public mods
 mod processor;

@@ -275,6 +275,14 @@ impl RenderThread {
         // Handle initial control messages
         self.handle_control_messages();
 
+        // With the worker pool, the caller is worker 0 and the (promoted)
+        // workers wait on its partitions: realtime scheduling for the duration
+        // of the render (Windows), restored when the guard drops.
+        #[cfg(not(target_arch = "wasm32"))]
+        let _promotion = super::rt_thread::promote_offline_render_thread(
+            self.graph.as_ref().is_some_and(Graph::uses_worker_pool),
+        );
+
         for quantum in 0..num_frames {
             // Suspend at given times and run callbacks
             if suspend_callbacks.first().map(|&(q, _)| q) == Some(quantum) {
@@ -411,8 +419,15 @@ impl RenderThread {
     }
 
     pub fn render<S: FromSample<f32> + Clone>(&mut self, output_buffer: &mut [S]) {
-        // Collect timing information
+        // Collect timing information. Started before the promotion below so
+        // a callback thread's one-time MMCSS registration (cpal gives us no
+        // hook on its thread before the first callback) counts in the stats.
         let render_start = Instant::now();
+
+        // Realtime scheduling for the callback thread (once per thread; a
+        // backend that owns its thread promotes it at start instead).
+        #[cfg(not(target_arch = "wasm32"))]
+        super::rt_thread::ensure_callback_thread_promoted();
         let frames = output_buffer.len() / self.number_of_channels;
 
         // Perform actual rendering

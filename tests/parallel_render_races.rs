@@ -199,3 +199,128 @@ fn feedback_delay_loops_render_byte_identical_across_workers() {
         }
     }
 }
+
+/// Every render worker flushes denormals, as worker 0 does (`tests/denormals.rs`):
+/// FTZ/DAZ are per-thread flags that spawned workers do not inherit, so a chain
+/// that a spawned worker renders used to keep its subnormal (and differ from the
+/// serial render).
+#[test]
+fn parallel_workers_flush_denormals_like_serial() {
+    let render = |workers: Option<usize>| {
+        let mut ctx = context(workers, 128 * 8);
+        let dest = ctx.destination();
+        // Independent chains, so the planner spreads them over every worker.
+        for _ in 0..16 {
+            let mut signal = ctx.create_constant_source();
+            signal.start();
+            let gain1 = ctx.create_gain();
+            gain1.gain().set_value(0.001);
+            let gain2 = ctx.create_gain();
+            gain2.gain().set_value(f32::MIN_POSITIVE); // 0.001 * MIN_POSITIVE is subnormal
+            let gain3 = ctx.create_gain();
+            gain3.gain().set_value(f32::MAX);
+            signal.connect(&gain1);
+            gain1.connect(&gain2);
+            gain2.connect(&gain3);
+            gain3.connect(&dest);
+        }
+        let out = ctx.start_rendering_sync();
+        (0..2)
+            .flat_map(|c| out.get_channel_data(c).to_vec())
+            .collect::<Vec<f32>>()
+    };
+    let serial = render(None);
+    assert!(serial.iter().all(|&s| s == 0.), "serial flushes denormals");
+    let parallel = render(Some(4));
+    let nonzero = parallel.iter().filter(|&&s| s != 0.).count();
+    assert_eq!(
+        nonzero, 0,
+        "parallel render kept {nonzero} denormal-derived samples"
+    );
+}
+
+/// Windows: an offline render on the worker pool runs its calling thread
+/// (worker 0, which the realtime workers wait on) at realtime priority for the
+/// duration of the render and restores it afterwards; a serial render leaves
+/// the caller's priority alone.
+#[cfg(windows)]
+#[test]
+fn offline_pool_render_promotes_the_calling_thread_for_the_render() {
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Arc;
+    use web_audio_api::worklet::{
+        AudioParamValues, AudioWorkletGlobalScope, AudioWorkletNode, AudioWorkletNodeOptions,
+        AudioWorkletProcessor, ThreadAffinity,
+    };
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentThread() -> *mut std::ffi::c_void;
+        fn GetThreadPriority(thread: *mut std::ffi::c_void) -> i32;
+    }
+    fn priority() -> i32 {
+        // SAFETY: pseudo-handle valid for the calling thread.
+        unsafe { GetThreadPriority(GetCurrentThread()) }
+    }
+
+    /// Records the priority of the thread it runs on (pinned to worker 0).
+    struct Probe(Arc<AtomicI32>);
+    impl AudioWorkletProcessor for Probe {
+        type ProcessorOptions = Arc<AtomicI32>;
+        fn constructor(seen: Arc<AtomicI32>) -> Self {
+            Self(seen)
+        }
+        fn thread_affinity() -> ThreadAffinity {
+            ThreadAffinity::RenderThread
+        }
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            _outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            _params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            self.0.store(priority(), Ordering::Relaxed);
+            true
+        }
+    }
+
+    let render = |workers: Option<usize>| {
+        std::thread::spawn(move || {
+            let mut ctx = context(workers, 128 * 4);
+            let seen = Arc::new(AtomicI32::new(i32::MIN));
+            let options = AudioWorkletNodeOptions {
+                processor_options: Arc::clone(&seen),
+                ..AudioWorkletNodeOptions::default()
+            };
+            let probe = AudioWorkletNode::new::<Probe>(&ctx, options);
+            probe.connect(&ctx.destination());
+            for _ in 0..8 {
+                let mut osc = ctx.create_oscillator();
+                osc.connect(&ctx.destination());
+                osc.start();
+            }
+            let before = priority();
+            let _ = ctx.start_rendering_sync();
+            (before, seen.load(Ordering::Relaxed), priority())
+        })
+        .join()
+        .unwrap()
+    };
+    const TIME_CRITICAL: i32 = 15;
+
+    let (before, during, after) = render(Some(4));
+    assert_eq!(before, 0);
+    assert_eq!(
+        during, TIME_CRITICAL,
+        "worker 0 is promoted while rendering"
+    );
+    assert_eq!(after, before, "the caller's priority is restored");
+
+    let (before, during, after) = render(None);
+    assert_eq!(
+        (before, during, after),
+        (0, 0, 0),
+        "serial render: unchanged"
+    );
+}
