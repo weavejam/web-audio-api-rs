@@ -101,6 +101,18 @@ fn process_inline_params(
         let mut param = nodes.get_unchecked(id).borrow_mut();
         scope.node_id.set(id);
         param.process(AudioParamValues::from(nodes), scope);
+        // An inline param has no incoming edge, but its input can still hold
+        // residue summed in while it was an ordinary node that was not
+        // rendered (muted in a cycle that is then broken). The render loop
+        // consumes such residue once and clears it after `process`; do the
+        // same, or the stale modulation is added again every quantum.
+        if param.has_inputs_connected {
+            param
+                .inputs
+                .iter_mut()
+                .for_each(AudioRenderQuantum::make_silent);
+            param.has_inputs_connected = false;
+        }
     }
 }
 
@@ -1553,7 +1565,24 @@ impl Graph {
                 }
             }
         }
-        let is_merge: Vec<bool> = audio_in_degree.iter().map(|&d| d >= 2).collect();
+        // A node left out of `ordered` (muted in a cycle) is never processed,
+        // but the serial render still sums its producers into its input, and
+        // that residue is consumed once the cycle is broken. So it is never a
+        // merge node: every producer pushes into it directly, which co-locates
+        // all of them with it (step 2) and keeps the serial summation order.
+        let mut in_ordered = vec![false; cap];
+        for &id in &self.ordered {
+            in_ordered[id.0 as usize] = true;
+        }
+        let mut shared_unrendered = false;
+        let is_merge: Vec<bool> = audio_in_degree
+            .iter()
+            .zip(&in_ordered)
+            .map(|(&d, &rendered)| {
+                shared_unrendered |= d >= 2 && !rendered;
+                d >= 2 && rendered
+            })
+            .collect();
 
         // 2. Union-find connected components under the *uncut* edges: every
         //    AudioParam edge (so a param node stays with the node it feeds) and
@@ -1592,7 +1621,8 @@ impl Graph {
                 }
             }
         }
-        if linked_partners {
+        // Co-locating the producers of an unrendered node can close loops too.
+        if linked_partners || shared_unrendered {
             self.collapse_partition_cycles(&mut uf, &is_merge, cap);
         }
 
@@ -1638,10 +1668,9 @@ impl Graph {
                 }
                 let to = edge.other_id.0 as usize;
                 if node_group[to] == usize::MAX {
-                    // Consumer is not in `ordered` (e.g. excluded as part of a cycle).
-                    // The serial render pushes into such a node's input buffer but never
-                    // processes it, so it cannot affect the destination output. Skip it:
-                    // it must not create a boundary slot or a partition-DAG edge.
+                    // Consumer is not in `ordered` (excluded as part of a cycle): a
+                    // direct push (see `is_merge`), never a boundary slot or a
+                    // partition-DAG edge.
                     continue;
                 }
                 if !is_merge[to] {
@@ -2379,6 +2408,65 @@ mod tests {
 
         let out = ctx.start_rendering_sync();
         (0..2).map(|c| out.get_channel_data(c).to_vec()).collect()
+    }
+
+    /// A GainNode whose gain param is fed by a constant source and by the gain
+    /// node itself: a muted cycle. While muted, the param is not rendered but
+    /// the source keeps summing into its input. After one quantum both inputs
+    /// to the param are disconnected, so it becomes inline-eligible with that
+    /// residue still in its input. Returns the first sample of each quantum.
+    fn render_broken_param_cycle(inline: bool, parallel: usize) -> Vec<f32> {
+        use crate::context::BaseAudioContext;
+        use crate::context::OfflineAudioContext;
+        use crate::node::{AudioNode, AudioScheduledSourceNode};
+        use crate::RENDER_QUANTUM_SIZE;
+        use std::sync::{Arc, Mutex};
+
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+        PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+        let sr = 48000.;
+        let q = RENDER_QUANTUM_SIZE as f64 / sr as f64;
+        let mut ctx = OfflineAudioContext::new(1, RENDER_QUANTUM_SIZE * 6, sr);
+        INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+        PARALLEL_OVERRIDE.with(|o| o.set(None));
+
+        let mut src = ctx.create_constant_source();
+        src.offset().set_value(1.);
+        let gain = ctx.create_gain();
+        src.connect(&gain);
+        src.connect(gain.gain());
+        gain.connect(gain.gain());
+        gain.connect(&ctx.destination());
+        src.start();
+
+        let src = Arc::new(Mutex::new(src));
+        let gain = Arc::new(Mutex::new(gain));
+        ctx.suspend_sync(q, move |_| {
+            let gain = gain.lock().unwrap();
+            src.lock().unwrap().disconnect_dest(gain.gain());
+            gain.disconnect_dest(gain.gain());
+        });
+
+        let out = ctx.start_rendering_sync();
+        out.get_channel_data(0)
+            .chunks(RENDER_QUANTUM_SIZE)
+            .map(|c| c[0])
+            .collect()
+    }
+
+    #[test]
+    fn test_inline_param_drops_residue_of_broken_cycle() {
+        let reference = render_broken_param_cycle(false, 0);
+        // muted cycle, then the residue in the param input consumed once,
+        // then the plain gain of 1
+        assert_eq!(reference, [0., 4., 1., 1., 1., 1.]);
+        for (inline, parallel) in [(true, 0), (false, 2), (true, 2), (true, 3)] {
+            assert_eq!(
+                render_broken_param_cycle(inline, parallel),
+                reference,
+                "inline = {inline}, parallel = {parallel}"
+            );
+        }
     }
 
     #[test]
