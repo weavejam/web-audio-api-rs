@@ -829,7 +829,7 @@ mod tests {
                 source.connect(&ctx.destination());
             });
         }
-        ctx.start_rendering_sync();
+        let _ = ctx.start_rendering_sync();
         let rows = rows.lock().unwrap();
         assert_eq!(rows.len(), 24);
         assert!(!rows[0].0);
