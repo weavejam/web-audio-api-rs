@@ -728,52 +728,122 @@ mod tests {
         assert_eq!(worklet.reported_latency_samples(), 42);
     }
 
+    type ParamRows = Arc<std::sync::Mutex<Vec<(bool, Vec<Vec<u32>>)>>>;
+    struct ParamProbe(ParamRows);
+    impl AudioWorkletProcessor for ParamProbe {
+        type ProcessorOptions = ParamRows;
+
+        fn constructor(rows: ParamRows) -> Self {
+            Self(rows)
+        }
+
+        fn parameter_descriptors() -> Vec<AudioParamDescriptor> {
+            ["gain", "idle"]
+                .map(|name| AudioParamDescriptor {
+                    name: name.into(),
+                    automation_rate: crate::AutomationRate::A,
+                    default_value: 0.25,
+                    min_value: -10.,
+                    max_value: 10.,
+                })
+                .into()
+        }
+
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            let values = ["gain", "idle"]
+                .map(|name| params.get(name).iter().map(|x| x.to_bits()).collect())
+                .into();
+            self.0.lock().unwrap().push((params.unchanged(), values));
+            outputs[0][0].fill(params.get("gain")[0]);
+            true
+        }
+    }
+
+    #[test]
+    fn test_unchanged_params_automation_property_serial_parallel_and_switches() {
+        let q = 128. / 48000.;
+        let mut reference = None;
+        for parallel in [0, 4] {
+            for (inline, clean) in [(true, true), (false, true), (true, false)] {
+                let mut ctx = crate::render::graph::param_test_context(inline, clean, parallel, 64);
+                let mut traces = Vec::new();
+                // Independent owners give the parallel executor multiple partitions.
+                for _ in 0..4 {
+                    let rows: ParamRows = Arc::default();
+                    let node = Arc::new(AudioWorkletNode::new::<ParamProbe>(
+                        &ctx,
+                        AudioWorkletNodeOptions {
+                            processor_options: Arc::clone(&rows),
+                            ..AudioWorkletNodeOptions::default()
+                        },
+                    ));
+                    node.connect(&ctx.destination());
+                    let param = node.parameters().get("gain").unwrap();
+                    param.set_value_at_time(0.5, 4.25 * q);
+                    param.linear_ramp_to_value_at_time(0.75, 8.5 * q);
+                    param.exponential_ramp_to_value_at_time(0.375, 12.5 * q);
+                    param.set_target_at_time(0.2, 16.25 * q, 0.5 * q);
+                    param.set_value_at_time(0.4, 25.25 * q);
+                    param.set_value_curve_at_time(&[0.4, 0.8, 0.3], 30.25 * q, 3.5 * q);
+                    param.set_value_at_time(0.6, 37.25 * q);
+                    param.set_value_at_time(0.9, 40.25 * q);
+                    ctx.suspend_sync(35. * q, move |_| {
+                        node.parameters()
+                            .get("gain")
+                            .unwrap()
+                            .cancel_scheduled_values(40. * q);
+                    });
+                    traces.push(rows);
+                }
+                let out = ctx.start_rendering_sync();
+                let bits: Vec<_> = out
+                    .get_channel_data(0)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert_eq!(&bits, reference.get_or_insert_with(|| bits.clone()));
+                for rows in traces {
+                    let rows = rows.lock().unwrap();
+                    assert_eq!(rows.len(), 64);
+                    assert!(!rows[0].0);
+                    if inline && clean {
+                        assert!(rows[63].0, "settled params must take the hint path");
+                    } else {
+                        assert!(rows.iter().all(|r| !r.0), "disabled hints must stay false");
+                    }
+                    for i in [4, 6, 10, 17, 20, 25, 31, 32, 35, 37] {
+                        assert!(!rows[i].0, "invalid hint at quantum {i}");
+                    }
+                    for i in [6, 10, 17, 20, 31, 32] {
+                        let values = &rows[i].1[0];
+                        assert!(values.windows(2).any(|p| p[0] != p[1]));
+                    }
+                    assert_eq!(rows[41].1[0], [0.6f32.to_bits()], "cancelled event fired");
+                    for pair in rows.windows(2) {
+                        if pair[1].0 {
+                            assert!(pair[1].1.iter().all(|p| p.len() == 1));
+                            assert_eq!(pair[0].1, pair[1].1, "hint must preserve every bit");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_unchanged_params_follow_messages_automation_and_connections() {
         use crate::node::AudioScheduledSourceNode;
-        use std::sync::Mutex;
-
-        type Rows = Arc<Mutex<Vec<(bool, Vec<Vec<u32>>)>>>;
-        struct Probe(Rows);
-        impl AudioWorkletProcessor for Probe {
-            type ProcessorOptions = Rows;
-
-            fn constructor(rows: Rows) -> Self {
-                Self(rows)
-            }
-
-            fn parameter_descriptors() -> Vec<AudioParamDescriptor> {
-                ["gain", "idle"]
-                    .map(|name| AudioParamDescriptor {
-                        name: name.into(),
-                        automation_rate: crate::AutomationRate::A,
-                        default_value: 0.25,
-                        min_value: -10.,
-                        max_value: 10.,
-                    })
-                    .into()
-            }
-
-            fn process<'a, 'b>(
-                &mut self,
-                _inputs: &'b [&'a [&'a [f32]]],
-                outputs: &'b mut [&'a mut [&'a mut [f32]]],
-                params: AudioParamValues<'b>,
-                _scope: &'b AudioWorkletGlobalScope,
-            ) -> bool {
-                let values = ["gain", "idle"]
-                    .map(|name| params.get(name).iter().map(|x| x.to_bits()).collect())
-                    .into();
-                self.0.lock().unwrap().push((params.unchanged(), values));
-                outputs[0][0].fill(params.get("gain")[0]);
-                true
-            }
-        }
 
         let q = 128. / 48000.;
         let mut ctx = OfflineAudioContext::new(1, 24 * 128, 48000.);
-        let rows: Rows = Arc::default();
-        let node = AudioWorkletNode::new::<Probe>(
+        let rows: ParamRows = Arc::default();
+        let node = AudioWorkletNode::new::<ParamProbe>(
             &ctx,
             AudioWorkletNodeOptions {
                 processor_options: Arc::clone(&rows),

@@ -188,7 +188,11 @@ impl std::fmt::Debug for Node {
 
 impl Node {
     /// Render an audio quantum
-    fn process(&mut self, mut params: AudioParamValues<'_>, scope: &AudioWorkletGlobalScope) -> bool {
+    fn process(
+        &mut self,
+        mut params: AudioParamValues<'_>,
+        scope: &AudioWorkletGlobalScope,
+    ) -> bool {
         params.unchanged = self.params_unchanged;
         #[cfg(feature = "param-profile")]
         let _timer = (self.is_audio_param && self.inline_owner.is_none())
@@ -2691,6 +2695,23 @@ impl Graph {
 }
 
 #[cfg(test)]
+pub(crate) fn param_test_context(
+    inline: bool,
+    clean: bool,
+    parallel: usize,
+    quanta: usize,
+) -> crate::context::OfflineAudioContext {
+    tests::INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+    tests::PARAMS_CLEAN_OVERRIDE.with(|o| o.set(Some(clean)));
+    tests::PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+    let context = crate::context::OfflineAudioContext::new(1, quanta * 128, 48000.);
+    tests::INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+    tests::PARAMS_CLEAN_OVERRIDE.with(|o| o.set(None));
+    tests::PARALLEL_OVERRIDE.with(|o| o.set(None));
+    context
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::DESTINATION_NODE_ID;
@@ -3149,6 +3170,54 @@ mod tests {
             add_edge(&mut graph, 1, 0); // re-plan
             step(&mut graph, true, "re-plan");
             step(&mut graph, false, "settled after the re-plan");
+        }
+    }
+
+    #[test]
+    fn test_unchanged_rejects_owner_of_cycle_muted_param() {
+        for parallel in [0, 4] {
+            let mut graph = Graph::new(llq::Queue::new().split().0);
+            graph.inline_params = true;
+            graph.params_clean = true;
+            graph.parallel_workers = parallel;
+            let node = Box::new(TestNode { tail_time: true });
+            for id in 0..3 {
+                add_node(&mut graph, id, node.clone());
+            }
+            add_edge(&mut graph, 2, 0);
+            for id in [3, 4] {
+                add_node(
+                    &mut graph,
+                    id,
+                    Box::new(CountingParam(std::sync::Arc::default())),
+                );
+                graph
+                    .nodes
+                    .get_unchecked_mut(AudioNodeId(id))
+                    .is_audio_param = true;
+                add_audioparam(&mut graph, id, 2);
+            }
+            // The owner remains rendered, but this param is absent from the
+            // order. Scanning only ordered params would miss NON_INLINE_PARAM.
+            add_edge(&mut graph, 4, 4);
+            let scope = AudioWorkletGlobalScope {
+                current_frame: 0,
+                current_time: 0.,
+                sample_rate: 48000.,
+                node_id: std::cell::Cell::new(AudioNodeId(0)),
+                event_sender: crossbeam_channel::unbounded().0,
+            };
+            for _ in 0..4 {
+                graph.render_quantum(&scope);
+                assert!(graph.ordered.contains(&AudioNodeId(2)));
+                assert!(graph.in_cycle.contains(&AudioNodeId(4)));
+                assert!(!graph.ordered.contains(&AudioNodeId(4)));
+                let owner = graph.nodes.get_unchecked(AudioNodeId(2)).borrow();
+                assert_eq!(owner.inline_params[..], [AudioNodeId(3)]);
+                assert!(owner.params_clean);
+                assert!(owner.has_non_inline_params);
+                assert!(!owner.params_unchanged);
+            }
         }
     }
 
