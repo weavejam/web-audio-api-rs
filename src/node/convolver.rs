@@ -11,6 +11,76 @@ use crate::RENDER_QUANTUM_SIZE;
 
 use super::{AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation};
 
+enum Convolver {
+    Fft(Box<FFTConvolver<f32>>),
+    Sparse(SparseConvolver),
+}
+
+impl Convolver {
+    fn new(partition_size: usize, impulse: &[f32]) -> Self {
+        const MAX_DIRECT_TAPS: usize = 8;
+        let taps: Vec<_> = impulse
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, gain)| *gain != 0.)
+            .take(MAX_DIRECT_TAPS + 1)
+            .collect();
+        if taps.len() <= MAX_DIRECT_TAPS && taps.iter().all(|(_, gain)| gain.is_finite()) {
+            // Direct FIR differs from FFT only by relative FFT roundoff: the
+            // absolute error scales with input level and impulse-response gain.
+            // Allocate on the control thread, never in process(). A 1M-frame
+            // single-tap IR still needs a next_power_of_two(len) ring (4 MiB).
+            let history_length = impulse.len().max(1).next_power_of_two();
+            return Self::Sparse(SparseConvolver {
+                taps,
+                history: vec![0.; history_length],
+                position: 0,
+            });
+        }
+
+        let mut fft = FFTConvolver::default();
+        fft.init(partition_size, impulse)
+            .expect("Unable to initialize convolution engine");
+        Self::Fft(Box::new(fft))
+    }
+
+    fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), fft_convolver::FFTConvolverError> {
+        match self {
+            Self::Fft(fft) => fft.process(input, output),
+            Self::Sparse(sparse) => {
+                sparse.process(input, output);
+                Ok(())
+            }
+        }
+    }
+}
+
+struct SparseConvolver {
+    taps: Vec<(usize, f32)>,
+    history: Vec<f32>,
+    position: usize,
+}
+
+impl SparseConvolver {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        let mask = self.history.len() - 1;
+        for (&sample, out) in input.iter().zip(output) {
+            self.history[self.position] = sample;
+            let mut sum = 0.;
+            for &(delay, gain) in &self.taps {
+                sum += self.history[self.position.wrapping_sub(delay) & mask] * gain;
+            }
+            *out = sum;
+            self.position = (self.position + 1) & mask;
+        }
+    }
+}
+
 /// Scale buffer by an equal-power normalization
 // see - <https://webaudio.github.io/web-audio-api/#dom-convolvernode-normalize>
 fn normalize_buffer(buffer: &AudioBuffer) -> f32 {
@@ -281,7 +351,7 @@ impl ConvolverNode {
             1.
         };
 
-        let mut convolvers = Vec::<FFTConvolver<f32>>::new();
+        let mut convolvers = Vec::<Convolver>::new();
         // @note - value defined by "rule of thumb", to be explored further
         let partition_size = RENDER_QUANTUM_SIZE * 8;
 
@@ -298,12 +368,7 @@ impl ConvolverNode {
                 .zip(buffer.get_channel_data(channel))
                 .for_each(|(o, i)| *o = *i * scale);
 
-            let mut convolver = FFTConvolver::<f32>::default();
-            convolver
-                .init(partition_size, &scaled_channel)
-                .expect("Unable to initialize convolution engine");
-
-            convolvers.push(convolver);
+            convolvers.push(Convolver::new(partition_size, &scaled_channel));
         }
 
         let msg = ConvolverInfosMessage {
@@ -328,13 +393,13 @@ impl ConvolverNode {
 }
 
 struct ConvolverInfosMessage {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
+    convolvers: Option<Vec<Convolver>>,
     impulse_length: usize,
     impulse_number_of_channels: usize,
 }
 
 struct ConvolverRenderer {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
+    convolvers: Option<Vec<Convolver>>,
     impulse_length: usize,
     impulse_number_of_channels: usize,
     tail_count: usize,
@@ -518,6 +583,272 @@ mod tests {
     use crate::node::{AudioBufferSourceNode, AudioBufferSourceOptions, AudioScheduledSourceNode};
 
     use super::*;
+
+    #[test]
+    fn test_sparse_zero_latency_and_tail_across_ring_wraps() {
+        for delay in [0, 127, 128, 1024, 4095] {
+            let mut impulse = vec![0.; delay + 3];
+            impulse[delay..].copy_from_slice(&[0.625, 0.25, 0.125]);
+            let mut convolver = Convolver::new(1024, &impulse);
+            assert!(matches!(convolver, Convolver::Sparse(_)));
+            let mut input = vec![0.; 3 * impulse.len() + 256];
+            input[0] = 1.;
+            input[127] = -0.5;
+            input[impulse.len() + 2] = 0.25;
+            let mut output = vec![0.; input.len()];
+            for (input, output) in input.chunks(128).zip(output.chunks_mut(128)) {
+                convolver.process(input, output).unwrap();
+            }
+            for (frame, &sample) in output.iter().enumerate() {
+                let expected: f32 = impulse
+                    .iter()
+                    .enumerate()
+                    .filter(|(tap, _)| *tap <= frame)
+                    .map(|(tap, gain)| gain * input[frame - tap])
+                    .sum();
+                assert_eq!(sample, expected, "delay {delay}, frame {frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_and_fft_match_direct_reference_with_streaming_input() {
+        let mut state = 42u32;
+        let mut random = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state as f64 / u32::MAX as f64 * 2. - 1.) as f32
+        };
+        for tap_count in [0, 1, 3, 8, 9] {
+            let mut impulse = vec![0.; 1027];
+            for tap in 0..tap_count {
+                impulse[tap * 128 + 2] = random() / 8.;
+            }
+            let mut convolver = Convolver::new(1024, &impulse);
+            assert_eq!(matches!(convolver, Convolver::Sparse(_)), tap_count <= 8);
+            let mut input: Vec<_> = (0..4096).map(|_| random()).collect();
+            input.extend(vec![0.; 2048]);
+            let mut actual = vec![0.; input.len()];
+            let expected: Vec<f32> = (0..input.len())
+                .map(|frame| {
+                    impulse
+                        .iter()
+                        .enumerate()
+                        .filter(|(tap, gain)| *tap <= frame && **gain != 0.)
+                        .map(|(tap, gain)| input[frame - tap] * gain)
+                        .sum()
+                })
+                .collect();
+            for (input, actual) in input.chunks(128).zip(actual.chunks_mut(128)) {
+                convolver.process(input, actual).unwrap();
+            }
+            assert_float_eq!(actual[..], expected[..], abs_all <= 1e-6);
+        }
+    }
+
+    fn node_with_backend(
+        context: &OfflineAudioContext,
+        impulse: AudioBuffer,
+        normalize: bool,
+        force_fft: bool,
+    ) -> ConvolverNode {
+        let scale = if normalize {
+            normalize_buffer(&impulse)
+        } else {
+            1.
+        };
+        let node = ConvolverNode::new(
+            context,
+            ConvolverOptions {
+                buffer: Some(impulse.clone()),
+                disable_normalization: !normalize,
+                ..ConvolverOptions::default()
+            },
+        );
+        if force_fft {
+            let convolvers = (0..impulse.number_of_channels().max(2))
+                .map(|channel| {
+                    let scaled: Vec<_> = impulse
+                        .get_channel_data(channel.min(impulse.number_of_channels() - 1))
+                        .iter()
+                        .map(|sample| sample * scale)
+                        .collect();
+                    let mut fft = FFTConvolver::default();
+                    fft.init(1024, &scaled).unwrap();
+                    Convolver::Fft(Box::new(fft))
+                })
+                .collect();
+            node.registration.post_message(ConvolverInfosMessage {
+                convolvers: Some(convolvers),
+                impulse_length: impulse.length(),
+                impulse_number_of_channels: impulse.number_of_channels(),
+            });
+        }
+        node
+    }
+
+    fn render_node(
+        input: Vec<Vec<f32>>,
+        impulse: Vec<Vec<f32>>,
+        normalize: bool,
+        force_fft: bool,
+    ) -> AudioBuffer {
+        let mut context = OfflineAudioContext::new(2, 4096, 48000.);
+        let conv = node_with_backend(
+            &context,
+            AudioBuffer::from(impulse, 48000.),
+            normalize,
+            force_fft,
+        );
+        let mut src = context.create_buffer_source();
+        src.set_buffer(AudioBuffer::from(input, 48000.));
+        src.connect(&conv);
+        conv.connect(&context.destination());
+        src.start();
+        context.start_rendering_sync()
+    }
+
+    #[test]
+    fn test_sparse_node_routing_normalization_and_mixed_backends() {
+        for inputs in [1, 2] {
+            for ir_channels in [2, 4] {
+                for normalize in [false, true] {
+                    for mixed in [false, true] {
+                        let input: Vec<Vec<f32>> = (0..inputs)
+                            .map(|channel| {
+                                (0..1536)
+                                    .map(|frame| ((frame * 17 + channel * 31) as f32 * 0.13).sin())
+                                    .collect()
+                            })
+                            .collect();
+                        let impulse: Vec<Vec<f32>> = (0..ir_channels)
+                            .map(|channel| {
+                                let mut ir = vec![0.; 1027];
+                                ir[3 + channel] = 0.625;
+                                ir[128 + channel] = -0.25;
+                                ir[1026 - channel] = 0.125;
+                                if mixed && channel % 2 == 1 {
+                                    for tap in 0..9 {
+                                        ir[256 + tap * 7] = 0.03125;
+                                    }
+                                }
+                                assert_eq!(
+                                    matches!(Convolver::new(1024, &ir), Convolver::Sparse(_)),
+                                    !mixed || channel % 2 == 0
+                                );
+                                ir
+                            })
+                            .collect();
+                        let sparse = render_node(input.clone(), impulse.clone(), normalize, false);
+                        let fft = render_node(input.clone(), impulse.clone(), normalize, true);
+                        let scale = if normalize {
+                            normalize_buffer(&AudioBuffer::from(impulse.clone(), 48000.))
+                        } else {
+                            1.
+                        };
+                        for output_channel in 0..2 {
+                            let actual = sparse.get_channel_data(output_channel);
+                            let reference = fft.get_channel_data(output_channel);
+                            let peak = actual
+                                .iter()
+                                .fold(0_f32, |peak, sample| peak.max(sample.abs()));
+                            for frame in 0..actual.len() {
+                                let routes = if ir_channels == 4 {
+                                    vec![output_channel, output_channel + 2]
+                                } else {
+                                    vec![output_channel]
+                                };
+                                let expected: f32 = routes
+                                    .iter()
+                                    .map(|&ir_channel| {
+                                        let source = if inputs == 1 {
+                                            0
+                                        } else if ir_channels == 4 {
+                                            ir_channel / 2
+                                        } else {
+                                            ir_channel
+                                        };
+                                        impulse[ir_channel]
+                                            .iter()
+                                            .enumerate()
+                                            .filter(|(tap, gain)| {
+                                                *tap <= frame
+                                                    && frame - *tap < input[source].len()
+                                                    && **gain != 0.
+                                            })
+                                            .map(|(tap, gain)| {
+                                                input[source][frame - tap] * (gain * scale)
+                                            })
+                                            .sum::<f32>()
+                                    })
+                                    .sum();
+                                assert!(
+                                    (actual[frame] - expected).abs() <= peak * 1e-6,
+                                    "routing {inputs}->{ir_channels}, frame {frame}"
+                                );
+                                assert!(
+                                    (actual[frame] - reference[frame]).abs() <= peak * 1e-6,
+                                    "FFT alignment at {frame}"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_node_set_buffer_cuts_old_tail() {
+        for force_fft in [false, true] {
+            let mut context = OfflineAudioContext::new(1, 1024, 48000.);
+            let mut old_ir = vec![0.; 512];
+            old_ir[0] = 1.;
+            old_ir[511] = 0.5;
+            let mut conv = node_with_backend(
+                &context,
+                AudioBuffer::from(vec![old_ir], 48000.),
+                false,
+                force_fft,
+            );
+            let mut input = vec![0.; 385];
+            input[0] = 1.;
+            input[384] = 0.75;
+            let mut src = context.create_buffer_source();
+            src.set_buffer(AudioBuffer::from(vec![input], 48000.));
+            src.connect(&conv);
+            conv.connect(&context.destination());
+            src.start();
+            context.suspend_sync(256. / 48000., move |_| {
+                conv.set_buffer(AudioBuffer::from(vec![vec![0., 0.25, 0.]], 48000.));
+            });
+            let result = context.start_rendering_sync();
+            for (frame, &sample) in result.get_channel_data(0).iter().enumerate() {
+                let expected = match frame {
+                    0 => 1.,
+                    385 => 0.1875,
+                    _ => 0.,
+                };
+                assert!((sample - expected).abs() < 1e-6, "stale tail at {frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_node_tail_ends_at_last_frame() {
+        for length in [127, 128, 129, 1027] {
+            let mut ir = vec![0.; length];
+            ir[0] = 0.625;
+            ir[length - 1] = 0.125;
+            let result = render_node(vec![vec![1.]], vec![ir.clone(), ir], false, false);
+            for channel in 0..2 {
+                let output = result.get_channel_data(channel);
+                assert_eq!(output[0], 0.625);
+                assert_eq!(output[length - 1], 0.125);
+                assert!(output[1..length - 1].iter().all(|sample| *sample == 0.));
+                assert!(output[length..].iter().all(|sample| *sample == 0.));
+            }
+        }
+    }
 
     #[test]
     #[should_panic]
