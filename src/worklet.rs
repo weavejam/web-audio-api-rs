@@ -773,6 +773,7 @@ mod tests {
             for (inline, clean) in [(true, true), (false, true), (true, false)] {
                 let mut ctx = crate::render::graph::param_test_context(inline, clean, parallel, 64);
                 let mut traces = Vec::new();
+                let mut nodes = Vec::new();
                 // Independent owners give the parallel executor multiple partitions.
                 for _ in 0..4 {
                     let rows: ParamRows = Arc::default();
@@ -793,14 +794,17 @@ mod tests {
                     param.set_value_curve_at_time(&[0.4, 0.8, 0.3], 30.25 * q, 3.5 * q);
                     param.set_value_at_time(0.6, 37.25 * q);
                     param.set_value_at_time(0.9, 40.25 * q);
-                    ctx.suspend_sync(35. * q, move |_| {
+                    nodes.push(node);
+                    traces.push(rows);
+                }
+                ctx.suspend_sync(35. * q, move |_| {
+                    for node in nodes {
                         node.parameters()
                             .get("gain")
                             .unwrap()
                             .cancel_scheduled_values(40. * q);
-                    });
-                    traces.push(rows);
-                }
+                    }
+                });
                 let out = ctx.start_rendering_sync();
                 let bits: Vec<_> = out
                     .get_channel_data(0)
