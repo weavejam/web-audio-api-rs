@@ -87,6 +87,9 @@ default = ["cpal"]
 # Expose structured runtime diagnostics for AudioContext and the render graph.
 diagnostics = []
 
+# Offline parameter-cost attribution, compiled out of normal builds.
+param-profile = []
+
 # Make AudioWorklet inputs follow the Web Audio spec for inactive inputs:
 # inputs[n] is an empty slice when no connected source is actively processing.
 # This is opt-in for v1 because existing processors may assume a stable channel count.

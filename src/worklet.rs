@@ -34,6 +34,18 @@ impl std::fmt::Debug for AudioParamValues<'_> {
 }
 
 impl<'a> AudioParamValues<'a> {
+    /// Whether all declared parameters are single-valued and bit-identical to
+    /// the previous render quantum. This is a conservative, constant-time hint:
+    /// `false` means values must be read, not necessarily that they changed.
+    ///
+    /// Always false after graph reordering or a parameter message, while any
+    /// parameter has automation pending, or while audio is connected to one.
+    /// A caller that did not consume the previous quantum's values must refresh
+    /// its own cache even when this returns true.
+    pub fn unchanged(&self) -> bool {
+        self.values.unchanged
+    }
+
     /// Get the computed values for the given [`AudioParam`]
     ///
     /// For k-rate params or if the (a-rate) parameter is constant for this block, it will provide
@@ -714,6 +726,198 @@ mod tests {
             abs_all <= 0.
         );
         assert_eq!(worklet.reported_latency_samples(), 42);
+    }
+
+    type ParamRows = Arc<std::sync::Mutex<Vec<(bool, Vec<Vec<u32>>)>>>;
+    struct ParamProbe(ParamRows);
+    impl AudioWorkletProcessor for ParamProbe {
+        type ProcessorOptions = ParamRows;
+
+        fn constructor(rows: ParamRows) -> Self {
+            Self(rows)
+        }
+
+        fn parameter_descriptors() -> Vec<AudioParamDescriptor> {
+            ["gain", "idle"]
+                .map(|name| AudioParamDescriptor {
+                    name: name.into(),
+                    automation_rate: crate::AutomationRate::A,
+                    default_value: 0.25,
+                    min_value: -10.,
+                    max_value: 10.,
+                })
+                .into()
+        }
+
+        fn process<'a, 'b>(
+            &mut self,
+            _inputs: &'b [&'a [&'a [f32]]],
+            outputs: &'b mut [&'a mut [&'a mut [f32]]],
+            params: AudioParamValues<'b>,
+            _scope: &'b AudioWorkletGlobalScope,
+        ) -> bool {
+            let values = ["gain", "idle"]
+                .map(|name| params.get(name).iter().map(|x| x.to_bits()).collect())
+                .into();
+            self.0.lock().unwrap().push((params.unchanged(), values));
+            outputs[0][0].fill(params.get("gain")[0]);
+            true
+        }
+    }
+
+    #[test]
+    fn test_unchanged_params_automation_property_serial_parallel_and_switches() {
+        let q = 128. / 48000.;
+        let mut reference = None;
+        for parallel in [0, 4] {
+            for (inline, clean) in [(true, true), (false, true), (true, false)] {
+                let mut ctx = crate::render::graph::param_test_context(inline, clean, parallel, 64);
+                let mut traces = Vec::new();
+                let mut nodes = Vec::new();
+                // Independent owners give the parallel executor multiple partitions.
+                for _ in 0..4 {
+                    let rows: ParamRows = Arc::default();
+                    let node = Arc::new(AudioWorkletNode::new::<ParamProbe>(
+                        &ctx,
+                        AudioWorkletNodeOptions {
+                            processor_options: Arc::clone(&rows),
+                            ..AudioWorkletNodeOptions::default()
+                        },
+                    ));
+                    node.connect(&ctx.destination());
+                    let param = node.parameters().get("gain").unwrap();
+                    param.set_value_at_time(0.5, 4.25 * q);
+                    param.linear_ramp_to_value_at_time(0.75, 8.5 * q);
+                    param.exponential_ramp_to_value_at_time(0.375, 12.5 * q);
+                    param.set_target_at_time(0.2, 16.25 * q, 0.5 * q);
+                    param.set_value_at_time(0.4, 25.25 * q);
+                    param.set_value_curve_at_time(&[0.4, 0.8, 0.3], 30.25 * q, 3.5 * q);
+                    param.set_value_at_time(0.6, 37.25 * q);
+                    param.set_value_at_time(0.9, 40.25 * q);
+                    nodes.push(node);
+                    traces.push(rows);
+                }
+                ctx.suspend_sync(35. * q, move |_| {
+                    for node in nodes {
+                        node.parameters()
+                            .get("gain")
+                            .unwrap()
+                            .cancel_scheduled_values(40. * q);
+                    }
+                });
+                let out = ctx.start_rendering_sync();
+                let bits: Vec<_> = out
+                    .get_channel_data(0)
+                    .iter()
+                    .map(|x| x.to_bits())
+                    .collect();
+                assert_eq!(&bits, reference.get_or_insert_with(|| bits.clone()));
+                for rows in traces {
+                    let rows = rows.lock().unwrap();
+                    assert_eq!(rows.len(), 64);
+                    assert!(!rows[0].0);
+                    if inline && clean {
+                        assert!(rows[63].0, "settled params must take the hint path");
+                    } else {
+                        assert!(rows.iter().all(|r| !r.0), "disabled hints must stay false");
+                    }
+                    for i in [4, 6, 10, 17, 20, 25, 31, 32, 35, 37] {
+                        assert!(!rows[i].0, "invalid hint at quantum {i}");
+                    }
+                    for i in [6, 10, 17, 20, 31, 32] {
+                        let values = &rows[i].1[0];
+                        assert!(values.windows(2).any(|p| p[0] != p[1]));
+                    }
+                    assert_eq!(rows[41].1[0], [0.6f32.to_bits()], "cancelled event fired");
+                    for pair in rows.windows(2) {
+                        if pair[1].0 {
+                            assert!(pair[1].1.iter().all(|p| p.len() == 1));
+                            assert_eq!(pair[0].1, pair[1].1, "hint must preserve every bit");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_unchanged_params_follow_messages_automation_and_connections() {
+        use crate::node::AudioScheduledSourceNode;
+
+        let q = 128. / 48000.;
+        let mut ctx = OfflineAudioContext::new(1, 24 * 128, 48000.);
+        let rows: ParamRows = Arc::default();
+        let node = AudioWorkletNode::new::<ParamProbe>(
+            &ctx,
+            AudioWorkletNodeOptions {
+                processor_options: Arc::clone(&rows),
+                ..AudioWorkletNodeOptions::default()
+            },
+        );
+        node.connect(&ctx.destination());
+        let node = Arc::new(node);
+        let mut source = ctx.create_constant_source();
+        source.offset().set_value(0.125);
+        source.start();
+        let source = Arc::new(source);
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(3. * q, move |_| {
+                node.parameters()
+                    .get("gain")
+                    .unwrap()
+                    .set_value_at_time(0.5, 5.25 * q);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(8. * q, move |_| {
+                node.parameters().get("gain").unwrap().set_value(-0.);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            ctx.suspend_sync(12. * q, move |_| {
+                node.parameters()
+                    .get("gain")
+                    .unwrap()
+                    .set_automation_rate(crate::AutomationRate::K);
+            });
+        }
+        {
+            let node = Arc::clone(&node);
+            let source = Arc::clone(&source);
+            ctx.suspend_sync(14. * q, move |_| {
+                source.connect(node.parameters().get("gain").unwrap());
+            });
+        }
+        {
+            let source = Arc::clone(&source);
+            ctx.suspend_sync(18. * q, move |_| source.disconnect());
+        }
+        {
+            let source = Arc::clone(&source);
+            // Removing an acyclic edge preserves the existing render order.
+            // A later re-plan can make the disconnected param inline again.
+            ctx.suspend_sync(20. * q, move |ctx| {
+                source.connect(&ctx.destination());
+            });
+        }
+        let _ = ctx.start_rendering_sync();
+        let rows = rows.lock().unwrap();
+        assert_eq!(rows.len(), 24);
+        assert!(!rows[0].0);
+        assert!(rows[2].0, "settled params should certify unchanged values");
+        for i in [3, 4, 5, 8, 12, 14, 15, 16, 17, 18] {
+            assert!(!rows[i].0, "invalid certificate at quantum {i}");
+        }
+        assert!(rows[23].0, "disconnected params should settle again");
+        for pair in rows.windows(2) {
+            if pair[1].0 {
+                assert!(pair[1].1.iter().all(|p| p.len() == 1));
+                assert_eq!(pair[0].1, pair[1].1, "certificate must preserve every bit");
+            }
+        }
     }
 
     #[test]

@@ -707,6 +707,8 @@ impl AudioProcessor for AudioParamProcessor {
                     && output.single_valued()
                     && output.channel_data(0)[0].to_bits() == value
                 {
+                    #[cfg(feature = "param-profile")]
+                    let _timer = crate::param_profile::Timer::new(11);
                     // As `compute_buffer` does: [[current value]] is the
                     // intrinsic value at the start of the quantum.
                     let clamped = self.intrinsic_value.clamp(self.min_value, self.max_value);
@@ -716,6 +718,8 @@ impl AudioProcessor for AudioParamProcessor {
             }
         }
 
+        #[cfg(feature = "param-profile")]
+        let _timer = crate::param_profile::Timer::new(10);
         let period = 1. / scope.sample_rate as f64;
         self.compute_intrinsic_values(scope.current_time, period, RENDER_QUANTUM_SIZE);
         self.mix_to_output(input, output);

@@ -409,6 +409,8 @@ impl AudioProcessor for ConvolverRenderer {
         _params: AudioParamValues<'_>,
         _scope: &AudioWorkletGlobalScope,
     ) -> bool {
+        #[cfg(feature = "param-profile")]
+        let _timer = crate::param_profile::Timer::new(7);
         // single input/output node
         let input = &inputs[0];
         let output = &mut outputs[0];
