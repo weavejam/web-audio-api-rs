@@ -86,6 +86,10 @@ pub struct Node {
     /// change what one of them computes: a message routed to it (event,
     /// automation rate), a channel-config change, and every re-plan.
     params_clean: bool,
+    /// An owner with any non-inline param cannot certify unchanged values.
+    has_non_inline_params: bool,
+    /// Captured BEFORE this quantum's inline evaluation, not after settling.
+    params_unchanged: bool,
     /// For an inline param: the owner whose `inline_params` holds it, so a
     /// message to the param can clear the owner's `params_clean`.
     inline_owner: Option<AudioNodeId>,
@@ -111,9 +115,17 @@ fn process_inline_params(
     inline_params: &[AudioNodeId],
     scope: &AudioWorkletGlobalScope,
 ) -> bool {
+    #[cfg(feature = "param-profile")]
+    let _timer = crate::param_profile::Timer::new(0);
+    #[cfg(feature = "param-profile")]
+    let mut already_settled = 0;
     let mut settled = true;
     for &id in inline_params {
         let mut param = nodes.get_unchecked(id).borrow_mut();
+        #[cfg(feature = "param-profile")]
+        {
+            already_settled += usize::from(param.processor.param_settled());
+        }
         scope.node_id.set(id);
         param.process(AudioParamValues::from(nodes), scope);
         settled &= param.processor.param_settled();
@@ -130,6 +142,11 @@ fn process_inline_params(
             param.has_inputs_connected = false;
         }
     }
+    #[cfg(feature = "param-profile")]
+    {
+        crate::param_profile::count(1, inline_params.len());
+        crate::param_profile::count(2, already_settled);
+    }
     settled
 }
 
@@ -143,7 +160,12 @@ fn run_inline_params(
     params_clean_enabled: bool,
     scope: &AudioWorkletGlobalScope,
 ) {
+    node.params_unchanged = node.params_clean && !node.has_non_inline_params;
+    #[cfg(feature = "param-profile")]
+    let _timer = (!node.inline_params.is_empty()).then(|| crate::param_profile::Timer::new(12));
     if node.params_clean || node.inline_params.is_empty() {
+        #[cfg(feature = "param-profile")]
+        crate::param_profile::count(3, node.inline_params.len());
         return;
     }
     let settled = process_inline_params(nodes, &node.inline_params, scope);
@@ -166,7 +188,15 @@ impl std::fmt::Debug for Node {
 
 impl Node {
     /// Render an audio quantum
-    fn process(&mut self, params: AudioParamValues<'_>, scope: &AudioWorkletGlobalScope) -> bool {
+    fn process(
+        &mut self,
+        mut params: AudioParamValues<'_>,
+        scope: &AudioWorkletGlobalScope,
+    ) -> bool {
+        params.unchanged = self.params_unchanged;
+        #[cfg(feature = "param-profile")]
+        let _timer = (self.is_audio_param && self.inline_owner.is_none())
+            .then(|| crate::param_profile::Timer::new(4));
         self.processor
             .process(&self.inputs[..], &mut self.outputs[..], params, scope)
     }
@@ -1378,6 +1408,8 @@ impl Graph {
                 is_audio_param,
                 inline_params: smallvec![],
                 params_clean: false,
+                has_non_inline_params: true,
+                params_unchanged: false,
                 inline_owner: None,
             }),
         );
@@ -1655,6 +1687,8 @@ impl Graph {
             let node = node.get_mut();
             node.inline_params.clear();
             node.params_clean = false;
+            node.has_non_inline_params = true;
+            node.params_unchanged = false;
             node.inline_owner = None;
         }
         if !self.inline_params {
@@ -1663,6 +1697,7 @@ impl Graph {
 
         const HAS_INCOMING: u8 = 1;
         const RENDERED: u8 = 2;
+        const NON_INLINE_PARAM: u8 = 4;
         let cap = self
             .nodes
             .keys()
@@ -1707,6 +1742,22 @@ impl Graph {
             nodes.get_unchecked(id).borrow_mut().inline_owner = Some(owner);
             false
         });
+        // Include params muted by cycles as well as ordinary ordered params.
+        // Only a fully inline owner may use its clean flag as a certificate.
+        for id in nodes.keys() {
+            let node = nodes.get_unchecked(id).borrow();
+            if node.is_audio_param && node.inline_owner.is_none() {
+                for edge in &node.outgoing_edges {
+                    if edge.other_index == usize::MAX {
+                        flags[edge.other_id.0 as usize] |= NON_INLINE_PARAM;
+                    }
+                }
+            }
+        }
+        for id in nodes.keys() {
+            nodes.get_unchecked(id).borrow_mut().has_non_inline_params =
+                flags[id.0 as usize] & NON_INLINE_PARAM != 0;
+        }
     }
 
     /// Hand the inline params of a freed node back to the render order (call
@@ -1728,6 +1779,8 @@ impl Graph {
     /// Both produce byte-identical output. This is the entry point the render
     /// thread should call.
     pub fn render_quantum(&mut self, scope: &AudioWorkletGlobalScope) -> &AudioRenderQuantum {
+        #[cfg(feature = "param-profile")]
+        crate::param_profile::count(9, 1);
         // Fill this (render) thread's buffer pool once, so it does not allocate
         // in its first quanta. A no-op after the first call on a thread.
         Alloc::prewarm(64);
@@ -2642,6 +2695,23 @@ impl Graph {
 }
 
 #[cfg(test)]
+pub(crate) fn param_test_context(
+    inline: bool,
+    clean: bool,
+    parallel: usize,
+    quanta: usize,
+) -> crate::context::OfflineAudioContext {
+    tests::INLINE_PARAMS_OVERRIDE.with(|o| o.set(Some(inline)));
+    tests::PARAMS_CLEAN_OVERRIDE.with(|o| o.set(Some(clean)));
+    tests::PARALLEL_OVERRIDE.with(|o| o.set(Some(parallel)));
+    let context = crate::context::OfflineAudioContext::new(1, quanta * 128, 48000.);
+    tests::INLINE_PARAMS_OVERRIDE.with(|o| o.set(None));
+    tests::PARAMS_CLEAN_OVERRIDE.with(|o| o.set(None));
+    tests::PARALLEL_OVERRIDE.with(|o| o.set(None));
+    context
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::context::DESTINATION_NODE_ID;
@@ -3100,6 +3170,54 @@ mod tests {
             add_edge(&mut graph, 1, 0); // re-plan
             step(&mut graph, true, "re-plan");
             step(&mut graph, false, "settled after the re-plan");
+        }
+    }
+
+    #[test]
+    fn test_unchanged_rejects_owner_of_cycle_muted_param() {
+        for parallel in [0, 4] {
+            let mut graph = Graph::new(llq::Queue::new().split().0);
+            graph.inline_params = true;
+            graph.params_clean = true;
+            graph.parallel_workers = parallel;
+            let node = Box::new(TestNode { tail_time: true });
+            for id in 0..3 {
+                add_node(&mut graph, id, node.clone());
+            }
+            add_edge(&mut graph, 2, 0);
+            for id in [3, 4] {
+                add_node(
+                    &mut graph,
+                    id,
+                    Box::new(CountingParam(std::sync::Arc::default())),
+                );
+                graph
+                    .nodes
+                    .get_unchecked_mut(AudioNodeId(id))
+                    .is_audio_param = true;
+                add_audioparam(&mut graph, id, 2);
+            }
+            // The owner remains rendered, but this param is absent from the
+            // order. Scanning only ordered params would miss NON_INLINE_PARAM.
+            add_edge(&mut graph, 4, 4);
+            let scope = AudioWorkletGlobalScope {
+                current_frame: 0,
+                current_time: 0.,
+                sample_rate: 48000.,
+                node_id: std::cell::Cell::new(AudioNodeId(0)),
+                event_sender: crossbeam_channel::unbounded().0,
+            };
+            for _ in 0..4 {
+                graph.render_quantum(&scope);
+                assert!(graph.ordered.contains(&AudioNodeId(2)));
+                assert!(graph.in_cycle.contains(&AudioNodeId(4)));
+                assert!(!graph.ordered.contains(&AudioNodeId(4)));
+                let owner = graph.nodes.get_unchecked(AudioNodeId(2)).borrow();
+                assert_eq!(owner.inline_params[..], [AudioNodeId(3)]);
+                assert!(owner.params_clean);
+                assert!(owner.has_non_inline_params);
+                assert!(!owner.params_unchanged);
+            }
         }
     }
 
