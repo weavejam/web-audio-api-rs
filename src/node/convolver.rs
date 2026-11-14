@@ -11,6 +11,72 @@ use crate::RENDER_QUANTUM_SIZE;
 
 use super::{AudioNode, AudioNodeOptions, ChannelConfig, ChannelCountMode, ChannelInterpretation};
 
+enum Convolver {
+    Fft(Box<FFTConvolver<f32>>),
+    Sparse(SparseConvolver),
+}
+
+impl Convolver {
+    fn new(partition_size: usize, impulse: &[f32]) -> Self {
+        const MAX_DIRECT_TAPS: usize = 8;
+        let taps: Vec<_> = impulse
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, gain)| *gain != 0.)
+            .take(MAX_DIRECT_TAPS + 1)
+            .collect();
+        if taps.len() <= MAX_DIRECT_TAPS && taps.iter().all(|(_, gain)| gain.is_finite()) {
+            let history_length = impulse.len().max(1).next_power_of_two();
+            return Self::Sparse(SparseConvolver {
+                taps,
+                history: vec![0.; history_length],
+                position: 0,
+            });
+        }
+
+        let mut fft = FFTConvolver::default();
+        fft.init(partition_size, impulse)
+            .expect("Unable to initialize convolution engine");
+        Self::Fft(Box::new(fft))
+    }
+
+    fn process(
+        &mut self,
+        input: &[f32],
+        output: &mut [f32],
+    ) -> Result<(), fft_convolver::FFTConvolverError> {
+        match self {
+            Self::Fft(fft) => fft.process(input, output),
+            Self::Sparse(sparse) => {
+                sparse.process(input, output);
+                Ok(())
+            }
+        }
+    }
+}
+
+struct SparseConvolver {
+    taps: Vec<(usize, f32)>,
+    history: Vec<f32>,
+    position: usize,
+}
+
+impl SparseConvolver {
+    fn process(&mut self, input: &[f32], output: &mut [f32]) {
+        let mask = self.history.len() - 1;
+        for (&sample, out) in input.iter().zip(output) {
+            self.history[self.position] = sample;
+            let mut sum = 0.;
+            for &(delay, gain) in &self.taps {
+                sum += self.history[self.position.wrapping_sub(delay) & mask] * gain;
+            }
+            *out = sum;
+            self.position = (self.position + 1) & mask;
+        }
+    }
+}
+
 /// Scale buffer by an equal-power normalization
 // see - <https://webaudio.github.io/web-audio-api/#dom-convolvernode-normalize>
 fn normalize_buffer(buffer: &AudioBuffer) -> f32 {
@@ -281,7 +347,7 @@ impl ConvolverNode {
             1.
         };
 
-        let mut convolvers = Vec::<FFTConvolver<f32>>::new();
+        let mut convolvers = Vec::<Convolver>::new();
         // @note - value defined by "rule of thumb", to be explored further
         let partition_size = RENDER_QUANTUM_SIZE * 8;
 
@@ -298,12 +364,7 @@ impl ConvolverNode {
                 .zip(buffer.get_channel_data(channel))
                 .for_each(|(o, i)| *o = *i * scale);
 
-            let mut convolver = FFTConvolver::<f32>::default();
-            convolver
-                .init(partition_size, &scaled_channel)
-                .expect("Unable to initialize convolution engine");
-
-            convolvers.push(convolver);
+            convolvers.push(Convolver::new(partition_size, &scaled_channel));
         }
 
         let msg = ConvolverInfosMessage {
@@ -328,13 +389,13 @@ impl ConvolverNode {
 }
 
 struct ConvolverInfosMessage {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
+    convolvers: Option<Vec<Convolver>>,
     impulse_length: usize,
     impulse_number_of_channels: usize,
 }
 
 struct ConvolverRenderer {
-    convolvers: Option<Vec<FFTConvolver<f32>>>,
+    convolvers: Option<Vec<Convolver>>,
     impulse_length: usize,
     impulse_number_of_channels: usize,
     tail_count: usize,
@@ -516,6 +577,65 @@ mod tests {
     use crate::node::{AudioBufferSourceNode, AudioBufferSourceOptions, AudioScheduledSourceNode};
 
     use super::*;
+
+    #[test]
+    fn test_sparse_zero_latency_and_tail_across_ring_wraps() {
+        for delay in [0, 127, 128, 1024, 4095] {
+            let mut impulse = vec![0.; delay + 3];
+            impulse[delay..].copy_from_slice(&[0.625, 0.25, 0.125]);
+            let mut convolver = Convolver::new(1024, &impulse);
+            assert!(matches!(convolver, Convolver::Sparse(_)));
+            let mut input = vec![0.; 3 * impulse.len() + 256];
+            input[0] = 1.;
+            input[127] = -0.5;
+            input[impulse.len() + 2] = 0.25;
+            let mut output = vec![0.; input.len()];
+            for (input, output) in input.chunks(128).zip(output.chunks_mut(128)) {
+                convolver.process(input, output).unwrap();
+            }
+            for (frame, &sample) in output.iter().enumerate() {
+                let expected: f32 = impulse
+                    .iter()
+                    .enumerate()
+                    .filter(|(tap, _)| *tap <= frame)
+                    .map(|(tap, gain)| gain * input[frame - tap])
+                    .sum();
+                assert_eq!(sample, expected, "delay {delay}, frame {frame}");
+            }
+        }
+    }
+
+    #[test]
+    fn test_sparse_matches_fft_with_streaming_input() {
+        let mut state = 42u32;
+        let mut random = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            (state as f64 / u32::MAX as f64 * 2. - 1.) as f32
+        };
+        for tap_count in [0, 1, 3, 8, 9] {
+            let mut impulse = vec![0.; 1027];
+            for tap in 0..tap_count {
+                impulse[tap * 128 + 2] = random() / 8.;
+            }
+            let mut convolver = Convolver::new(1024, &impulse);
+            assert_eq!(matches!(convolver, Convolver::Sparse(_)), tap_count <= 8);
+            let mut reference = FFTConvolver::default();
+            reference.init(1024, &impulse).unwrap();
+            let mut input: Vec<_> = (0..4096).map(|_| random()).collect();
+            input.extend(vec![0.; 2048]);
+            let mut actual = vec![0.; input.len()];
+            let mut expected = actual.clone();
+            for ((input, actual), expected) in input
+                .chunks(128)
+                .zip(actual.chunks_mut(128))
+                .zip(expected.chunks_mut(128))
+            {
+                convolver.process(input, actual).unwrap();
+                reference.process(input, expected).unwrap();
+            }
+            assert_float_eq!(actual[..], expected[..], abs_all <= 1e-6);
+        }
+    }
 
     #[test]
     #[should_panic]
