@@ -24,6 +24,41 @@ struct Coefficients {
     a2: f64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CoefficientKey {
+    type_: BiquadFilterType,
+    sample_rate: u32,
+    params: [u32; 4],
+}
+
+#[derive(Default)]
+struct CoefficientCache(Option<(CoefficientKey, Coefficients)>);
+
+impl CoefficientCache {
+    fn get(&mut self, key: CoefficientKey) -> Coefficients {
+        if let Some((previous, coef)) = self.0 {
+            if previous == key {
+                return coef;
+            }
+        }
+        let [frequency, detune, q, gain] = key.params.map(f32::from_bits);
+        let coef = calculate_coefs(
+            key.type_,
+            f64::from(f32::from_bits(key.sample_rate)),
+            f64::from(get_computed_freq(frequency, detune)),
+            f64::from(gain),
+            f64::from(q),
+        );
+        self.0 = Some((key, coef));
+        coef
+    }
+}
+
+fn param_varies(values: &[f32]) -> bool {
+    let first = values[0].to_bits();
+    values[1..].iter().any(|value| value.to_bits() != first)
+}
+
 // all coefs calculation functions adapted from `/wpt/webaudio/resources/biquad-filters.js`
 fn normalize_coefs(b0: f64, b1: f64, b2: f64, a0: f64, a1: f64, a2: f64) -> Coefficients {
     let scale = 1. / a0;
@@ -600,6 +635,7 @@ impl BiquadFilterNode {
                 type_,
                 xy: ArrayVec::new(),
                 coefs: Box::new([Coefficients::default(); RENDER_QUANTUM_SIZE]),
+                coefficient_cache: CoefficientCache::default(),
             };
 
             let node = Self {
@@ -763,6 +799,7 @@ struct BiquadFilterRenderer {
     // per-frame coefficients while a param is a-rate (allocated once, at
     // construction on the control thread)
     coefs: Box<[Coefficients; RENDER_QUANTUM_SIZE]>,
+    coefficient_cache: CoefficientCache,
 }
 
 impl AudioProcessor for BiquadFilterRenderer {
@@ -825,21 +862,24 @@ impl AudioProcessor for BiquadFilterRenderer {
         let q = params.get(&self.q);
         let gain = params.get(&self.gain);
         let sample_rate_f64 = f64::from(sample_rate);
-        // compute first coef and fill the coef list with this value
-        let computed_freq = get_computed_freq(frequency[0], detune[0]);
-        let coef = calculate_coefs(
+        let key = CoefficientKey {
             type_,
-            sample_rate_f64,
-            f64::from(computed_freq),
-            f64::from(gain[0]),
-            f64::from(q[0]),
-        );
+            sample_rate: sample_rate.to_bits(),
+            params: [
+                frequency[0].to_bits(),
+                detune[0].to_bits(),
+                q[0].to_bits(),
+                gain[0].to_bits(),
+            ],
+        };
+        let coef = self.coefficient_cache.get(key);
 
-        // if one of the params has a length of RENDER_QUANTUM_SIZE, we need
-        // to compute the coefs for each frame (into the renderer's own buffer:
-        // a static filter neither fills nor reads a 128-entry list)
-        let automated =
-            frequency.len() != 1 || detune.len() != 1 || q.len() != 1 || gain.len() != 1;
+        // A-rate values can hold still for a whole quantum. In that case the
+        // scalar coefficient path also avoids filling/reading the per-frame list.
+        let automated = param_varies(&frequency)
+            || param_varies(&detune)
+            || param_varies(&q)
+            || param_varies(&gain);
         if automated {
             let coefs_list = &mut *self.coefs;
             coefs_list[0] = coef;
@@ -849,12 +889,7 @@ impl AudioProcessor for BiquadFilterRenderer {
             // so this is bit-exact; it saves the f64 trig of every frame of
             // a param that is a-rate but holding still (an automation lane
             // between breakpoints, a step, a slow ramp in f32 steps).
-            let mut prev = [
-                frequency[0].to_bits(),
-                detune[0].to_bits(),
-                q[0].to_bits(),
-                gain[0].to_bits(),
-            ];
+            let mut prev = key.params;
             let mut prev_coef = coef;
             coefs_list
                 .iter_mut()
@@ -878,6 +913,13 @@ impl AudioProcessor for BiquadFilterRenderer {
                     }
                     *coefs = prev_coef;
                 });
+            self.coefficient_cache.0 = Some((
+                CoefficientKey {
+                    params: prev,
+                    ..key
+                },
+                prev_coef,
+            ));
         };
 
         // Stereo: both channels in one 2-lane f64 register (SSE2 / NEON, the
@@ -1209,6 +1251,64 @@ mod tests {
     use crate::context::{BaseAudioContext, OfflineAudioContext};
 
     use super::*;
+
+    #[test]
+    fn coefficient_cache_tracks_every_input_bit_exactly() {
+        let mut cache = CoefficientCache::default();
+        for type_ in [
+            BiquadFilterType::Lowpass,
+            BiquadFilterType::Highpass,
+            BiquadFilterType::Bandpass,
+            BiquadFilterType::Notch,
+            BiquadFilterType::Allpass,
+            BiquadFilterType::Peaking,
+            BiquadFilterType::Lowshelf,
+            BiquadFilterType::Highshelf,
+        ] {
+            for sample_rate in [48000_f32, 44100.] {
+                for params in [
+                    [350_f32, 0., 1., 0.],
+                    [350., -0., 1., 0.],
+                    [1200., -0., 1., 0.],
+                    [1200., 100., 1., 0.],
+                    [1200., 100., 4., 0.],
+                    [1200., 100., 4., 6.],
+                    [0., 0., 0., -0.],
+                    [24000., 0., 1., 0.],
+                ] {
+                    let [frequency, detune, q, gain] = params;
+                    let expected = calculate_coefs(
+                        type_,
+                        f64::from(sample_rate),
+                        f64::from(get_computed_freq(frequency, detune)),
+                        f64::from(gain),
+                        f64::from(q),
+                    );
+                    let bits = |c: Coefficients| [c.b0, c.b1, c.b2, c.a1, c.a2].map(f64::to_bits);
+                    let key = CoefficientKey {
+                        type_,
+                        sample_rate: sample_rate.to_bits(),
+                        params: params.map(f32::to_bits),
+                    };
+                    for _ in 0..2 {
+                        assert_eq!(bits(cache.get(key)), bits(expected));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn held_a_rate_preserves_signed_zero_and_nan_bits() {
+        for value in [0_f32, -0., 350., f32::from_bits(0x7fc00001)] {
+            assert!(!param_varies(&[value]));
+            let mut values = [value; RENDER_QUANTUM_SIZE];
+            assert!(!param_varies(&values));
+            values[RENDER_QUANTUM_SIZE - 1] = f32::from_bits(value.to_bits() ^ 1);
+            assert!(param_varies(&values));
+        }
+        assert!(param_varies(&[0., -0.]));
+    }
 
     #[test]
     fn test_computed_freq() {
